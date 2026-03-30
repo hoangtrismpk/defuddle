@@ -62,19 +62,33 @@ export class RedditExtractor extends BaseExtractor {
 		// shreddit-comment elements (those require JS). Return empty
 		// so parseAsync() falls through to extractAsync() which fetches
 		// old.reddit.com with full content.
-		const hasComments = this.document.querySelectorAll('shreddit-comment').length > 0;
-		if (this.isCommentsPage() && !hasComments) {
-			return { content: '', contentHtml: '' };
-		}
-
-		const postContent = this.getPostContent();
-		const comments = this.options.includeReplies !== false ? this.extractComments() : '';
-
-		const contentHtml = this.createContentHtml(postContent, comments);
 		const postTitle = this.document.querySelector('h1')?.textContent?.trim() || '';
 		const subreddit = this.getSubreddit();
 		const postAuthor = this.getPostAuthor();
+		const postContent = this.getPostContent();
 		const description = this.createDescription(postContent);
+
+		const hasComments = this.document.querySelectorAll('shreddit-comment').length > 0;
+		if (this.isCommentsPage() && !hasComments) {
+			return {
+				content: '',
+				contentHtml: '',
+				extractedContent: {
+					postId: this.getPostId(),
+					subreddit,
+					postAuthor,
+				},
+				variables: {
+					title: postTitle,
+					author: postAuthor,
+					site: `r/${subreddit}`,
+					description,
+				}
+			};
+		}
+
+		const comments = this.options.includeReplies !== false ? this.extractComments() : '';
+		const contentHtml = this.createContentHtml(postContent, comments);
 
 		return {
 			content: contentHtml,

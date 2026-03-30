@@ -5,11 +5,28 @@ import { textPreview, countWords } from '../utils';
 const CONTENT_DATE_PATTERN = /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i;
 const CONTENT_READ_TIME_PATTERN = /\d+\s*min(?:ute)?s?\s+read\b/i;
 const BYLINE_UPPERCASE_PATTERN = /^\p{Lu}/u;
+const STARTS_WITH_BY_PATTERN = /^by\s+\S/i;
 const BOILERPLATE_PATTERNS = [
 	/^This (?:article|story|piece) (?:appeared|was published|originally appeared) in\b/i,
 	/^A version of this (?:article|story) (?:appeared|was published) in\b/i,
 	/^Originally (?:published|appeared) (?:in|on|at)\b/i,
+	/^Any re-?use permitted\b/i,
+	/^©\s*(?:Copyright\s+)?\d{4}/i,
+	/^Comments?$/i,
+	/^Leave a (?:comment|reply)$/i,
 ];
+const NEWSLETTER_PATTERN = /\bsubscribe\b[\s\S]{0,40}\bnewsletter\b|\bnewsletter\b[\s\S]{0,40}\bsubscribe\b|\bsign[- ]up\b[\s\S]{0,80}\b(?:newsletter|email alert)/i;
+
+function isNewsletterElement(el: Element, maxWords: number): boolean {
+	const text = el.textContent?.trim() || '';
+	const words = countWords(text);
+	if (words < 2 || words > maxWords) return false;
+	if (el.querySelector(CONTENT_ELEMENT_SELECTOR)) return false;
+	const normalizedText = text.replace(/([a-z])([A-Z])/g, '$1 $2');
+	return NEWSLETTER_PATTERN.test(normalizedText);
+}
+const RELATED_HEADING_PATTERN = /^(?:related (?:posts?|articles?|content|stories|reads?|reading)|you (?:might|may|could) (?:also )?(?:like|enjoy|be interested in)|read (?:next|more|also)|further reading|see also|more (?:from|articles?|posts?|like this)|more to (?:read|explore)|about (?:the )?author)$/i;
+
 // Shared date/number patterns for stripping metadata text.
 const METADATA_STRIP_BASE = [
 	/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b/gi,
@@ -28,6 +45,15 @@ const BYLINE_STRIP_PATTERNS = [
 	/\bby\b/gi,
 	/[/|·•—–\-,]+/g,
 ];
+
+function walkUpToWrapper(el: Element, text: string, mainContent: Element): Element {
+	let target = el;
+	while (target.parentElement && target.parentElement !== mainContent) {
+		if ((target.parentElement.textContent?.trim() || '') !== text) break;
+		target = target.parentElement;
+	}
+	return target;
+}
 
 function removeTrailingSiblings(element: Element, removeSelf: boolean, debug: boolean, debugRemovals?: DebugRemoval[]) {
 	let sibling = element.nextElementSibling;
@@ -53,6 +79,38 @@ function removeTrailingSiblings(element: Element, removeSelf: boolean, debug: bo
 		}
 		element.remove();
 	}
+}
+
+// Walk up from `el` toward `mainContent` as long as each level has no preceding
+// siblings with meaningful content (≤ 10 words total). Returns the highest such ancestor.
+// Used to find the outermost container that is exclusively a trailing/isolated section.
+function walkUpIsolated(el: Element, mainContent: Element): Element {
+	let target = el;
+	while (target.parentElement && target.parentElement !== mainContent) {
+		let precedingWords = 0;
+		let sib = target.previousElementSibling;
+		while (sib) {
+			precedingWords += countWords(sib.textContent || '');
+			if (precedingWords > 10) break;
+			sib = sib.previousElementSibling;
+		}
+		if (precedingWords > 10) break;
+		target = target.parentElement;
+	}
+	return target;
+}
+
+// If the element immediately preceding `target` is a thin section (< 50 words, no content
+// elements), remove it. These are typically CTA or promo blocks before related-posts sections.
+function removeThinPrecedingSection(target: Element, debug: boolean, debugRemovals?: DebugRemoval[]) {
+	const prevSib = target.previousElementSibling;
+	if (!prevSib) return;
+	if (countWords(prevSib.textContent || '') >= 50) return;
+	if (prevSib.querySelector(CONTENT_ELEMENT_SELECTOR)) return;
+	if (debug && debugRemovals) {
+		debugRemovals.push({ step: 'removeByContentPattern', reason: 'thin CTA section', text: textPreview(prevSib) });
+	}
+	prevSib.remove();
 }
 
 /**
@@ -131,7 +189,62 @@ function removeHeroHeader(mainContent: Element, debug: boolean, debugRemovals?: 
 	}
 }
 
+// Some CMSs inject a breadcrumb (Home › Posts › Title) as the first element
+// of the article body with no semantic class — identified by internal-only links where at
+// least one targets the site root or a shallow path (/archive, /posts, /blog).
+function isBreadcrumbList(list: Element): boolean {
+	const listItems = list.querySelectorAll('li');
+	if (listItems.length < 2 || listItems.length > 8) return false;
+
+	const listLinks = Array.from(list.querySelectorAll('a'));
+	if (listLinks.length < 1 || listLinks.length >= listItems.length) return false;
+	if (list.querySelector('img, p, figure, blockquote')) return false;
+
+	let allInternal = true;
+	let hasBreadcrumbLink = false;
+	let shortLinkTexts = true;
+	for (const a of listLinks) {
+		const href = a.getAttribute('href') || '';
+		if (href.startsWith('http') || href.startsWith('//')) { allInternal = false; break; }
+		if (href === '/' || /^\/[a-zA-Z0-9_-]+\/?$/.test(href)) hasBreadcrumbLink = true;
+		if (((a.textContent || '').trim().split(/\s+/).filter(Boolean).length) > 5) shortLinkTexts = false;
+	}
+	return allInternal && hasBreadcrumbLink && shortLinkTexts;
+}
+
 export function removeByContentPattern(mainContent: Element, debug: boolean, url: string, debugRemovals?: DebugRemoval[]) {
+	const firstList = mainContent.querySelector('ul, ol');
+	if (firstList && isBreadcrumbList(firstList)) {
+		let target: Element = firstList;
+		while (target.parentElement && target.parentElement !== mainContent &&
+			   target.parentElement.children.length === 1) {
+			target = target.parentElement;
+		}
+		if (debug && debugRemovals) {
+			debugRemovals.push({ step: 'removeByContentPattern', reason: 'breadcrumb navigation list', text: textPreview(target) });
+		}
+		target.remove();
+	}
+
+	// Remove promotional block <a> elements appearing before the first heading.
+	// These are announcement banners (e.g. "You're Invited: ...") injected above the article.
+	// Identified by: appears before the first <h1>, has block children (a <div>), short text.
+	const firstH1 = mainContent.querySelector('h1');
+	if (firstH1) {
+		for (const link of mainContent.querySelectorAll('a[href]')) {
+			if (!link.parentNode) continue;
+			if (!(link.compareDocumentPosition(firstH1) & 4)) continue;
+			if (!link.querySelector('div')) continue;
+			const text = link.textContent?.trim() || '';
+			if (countWords(text) > 25) continue;
+			if (/[.!?]\s/.test(text)) continue;
+			if (debug && debugRemovals) {
+				debugRemovals.push({ step: 'removeByContentPattern', reason: 'promotional banner link', text: textPreview(link) });
+			}
+			link.remove();
+		}
+	}
+
 	// Remove hero header blocks — containers near the top of content that
 	// wrap date, title heading, author, tags, and a hero image together.
 	// After individual metadata elements are stripped, these leave behind
@@ -141,89 +254,87 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 	const contentText = mainContent.textContent || '';
 	const candidates = Array.from(mainContent.querySelectorAll('p, span, div, time'));
 
-	// Remove read time metadata (e.g. "Mar 4th 2026 | 3 min read")
-	// Only removes leaf elements whose text is PURELY date + read time,
-	// not mixed with other meaningful content like tag names.
+	// Single pass over candidates for all metadata-removal checks.
+	// Shared work (text extraction, word count, closest check, indexOf) is computed
+	// once per element instead of once per loop per element.
+	let bylineFound = false;
+	let authorDateFound = false;
+
 	for (const el of candidates) {
 		if (!el.parentNode) continue;
-		if (el.closest('pre') || el.closest('code')) continue;
 
 		const text = el.textContent?.trim() || '';
 		const words = countWords(text);
 
-		// Match date + read time in short elements
-		if (words <= 15 && CONTENT_DATE_PATTERN.test(text) && CONTENT_READ_TIME_PATTERN.test(text)) {
-			// Ensure this is a leaf-ish element, not a large container
-			if (el.querySelectorAll('p, div, section, article').length === 0) {
-				// Verify the text is ONLY date + read time metadata
-				// by stripping all date/time words and checking nothing remains
-				let cleaned = text;
-				for (const pattern of READ_TIME_STRIP_PATTERNS) {
-					cleaned = cleaned.replace(pattern, '');
-				}
-				if (cleaned.trim().length > 0) continue;
+		// All checks target short metadata elements; skip anything clearly too long.
+		if (words > 15 || words === 0) continue;
 
+		if (el.closest('pre, code')) continue;
+
+		const tag = el.tagName;
+		const hasDate = CONTENT_DATE_PATTERN.test(text);
+		// Defer indexOf — only compute when a check needs it
+		let pos = -2; // sentinel: not yet computed
+		const getPos = () => { if (pos === -2) pos = contentText.indexOf(text); return pos; };
+
+		// Remove article metadata header blocks (DIV only) near the top of content.
+		// Catches Tailwind-based blog layouts with non-semantic date+category divs.
+		if (tag === 'DIV' && words >= 1 && words <= 10 && hasDate && !/[.!?]/.test(text) && getPos() <= 400) {
+			if (!Array.from(el.querySelectorAll('p, h1, h2, h3, h4, h5, h6')).some(b => countWords(b.textContent || '') > 8)) {
 				if (debug && debugRemovals) {
-					debugRemovals.push({
-						step: 'removeByContentPattern',
-						reason: 'read time metadata',
-						text: textPreview(el)
-					});
+					debugRemovals.push({ step: 'removeByContentPattern', reason: 'article metadata header block', text: textPreview(el) });
 				}
 				el.remove();
+				continue;
 			}
 		}
-	}
 
-	// Remove author + date bylines near the start of content.
-	// Short elements whose text is ONLY a person name + date + separators,
-	// in any order. Catches Tailwind/CSS-in-JS sites with non-semantic
-	// class names that can't be matched by selector removal.
-	for (const el of candidates) {
-		if (!el.parentNode) continue;
-		if (el.closest('pre') || el.closest('code')) continue;
-
-		const text = el.textContent?.trim() || '';
-		const words = countWords(text);
-		if (words > 10 || words < 2) continue;
-
-		// Must contain a date — without one, short capitalized text
-		// could be a heading or label, not a byline.
-		if (!CONTENT_DATE_PATTERN.test(text)) continue;
-
-		// Strip date, year, separators, and "by" — if only
-		// capitalized name-like words remain, this is a byline.
-		let residual = text;
-		for (const pattern of BYLINE_STRIP_PATTERNS) {
-			residual = residual.replace(pattern, '');
-		}
-		residual = residual.trim();
-		if (!residual) continue;
-		const nameWords = residual.split(/\s+/).filter(w => w.length > 0);
-		if (nameWords.length === 0 || nameWords.length > 4) continue;
-		if (!nameWords.every(w => BYLINE_UPPERCASE_PATTERN.test(w))) continue;
-
-		// Must be near the start of content
-		const pos = contentText.indexOf(text);
-		if (pos > 500) continue;
-
-		// Walk up through wrappers whose only text content matches
-		let target: Element = el;
-		while (target.parentElement && target.parentElement !== mainContent) {
-			const parentText = target.parentElement.textContent?.trim() || '';
-			if (parentText !== text) break;
-			target = target.parentElement;
+		// Remove standalone "By [Name]" author bylines near the start of content.
+		if (!bylineFound && STARTS_WITH_BY_PATTERN.test(text) && words >= 2 && !/[.!?]$/.test(text) && getPos() <= 600) {
+			const target = walkUpToWrapper(el, text, mainContent);
+			if (debug && debugRemovals) {
+				debugRemovals.push({ step: 'removeByContentPattern', reason: 'author byline', text: textPreview(target) });
+			}
+			target.remove();
+			bylineFound = true;
+			continue;
 		}
 
-		if (debug && debugRemovals) {
-			debugRemovals.push({
-				step: 'removeByContentPattern',
-				reason: 'author date metadata',
-				text: textPreview(target)
-			});
+		// Remove read time metadata (e.g. "Mar 4th 2026 | 3 min read").
+		if (hasDate && CONTENT_READ_TIME_PATTERN.test(text) && el.querySelectorAll('p, div, section, article').length === 0) {
+			let cleaned = text;
+			for (const pattern of READ_TIME_STRIP_PATTERNS) {
+				cleaned = cleaned.replace(pattern, '');
+			}
+			if (cleaned.trim().length === 0) {
+				if (debug && debugRemovals) {
+					debugRemovals.push({ step: 'removeByContentPattern', reason: 'read time metadata', text: textPreview(el) });
+				}
+				el.remove();
+				continue;
+			}
 		}
-		target.remove();
-		break;
+
+		// Remove author + date bylines (name + date, any order) near the start.
+		if (!authorDateFound && words >= 2 && words <= 10 && hasDate && getPos() <= 500) {
+			let residual = text;
+			for (const pattern of BYLINE_STRIP_PATTERNS) {
+				residual = residual.replace(pattern, '');
+			}
+			residual = residual.trim();
+			if (residual) {
+				const nameWords = residual.split(/\s+/).filter(w => w.length > 0);
+				if (nameWords.length >= 1 && nameWords.length <= 4 && nameWords.every(w => BYLINE_UPPERCASE_PATTERN.test(w))) {
+					const target = walkUpToWrapper(el, text, mainContent);
+					if (debug && debugRemovals) {
+						debugRemovals.push({ step: 'removeByContentPattern', reason: 'author date metadata', text: textPreview(target) });
+					}
+					target.remove();
+					authorDateFound = true;
+					continue;
+				}
+			}
+		}
 	}
 
 	// Remove standalone time/date elements near the start or end of content.
@@ -317,13 +428,7 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 		// Total text should be very short — this is metadata, not content
 		if (countWords(listText) > 30) continue;
 
-		// Walk up to find the container to remove (e.g. a wrapper div)
-		let target: Element = list;
-		while (target.parentElement && target.parentElement !== mainContent) {
-			const parentText = target.parentElement.textContent?.trim() || '';
-			if (parentText !== listText) break;
-			target = target.parentElement;
-		}
+		const target = walkUpToWrapper(list, listText, mainContent);
 
 		if (debug && debugRemovals) {
 			debugRemovals.push({
@@ -354,6 +459,7 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 	} catch {}
 	if (urlPath) {
 		const shortElements = mainContent.querySelectorAll('div, span, p, a[href]');
+		const firstHeading = mainContent.querySelector('h1, h2, h3');
 		for (const el of shortElements) {
 			if (!el.parentNode) continue;
 			const text = el.textContent?.trim() || '';
@@ -361,9 +467,14 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 			if (words > 10) continue;
 			// Must be a leaf-ish element (no block children)
 			if (el.querySelectorAll('p, div, section, article').length > 0) continue;
-			// For bare <a> elements, skip if embedded in flowing prose (parent has other text)
+			// For bare <a> elements, skip if embedded in flowing prose (parent has other text).
+			// Exception: allow embedded <a> elements that appear before the first heading —
+			// these are back-navigation links in page headers, not inline prose links.
 			if (el.matches('a[href]') && el.parentElement && el.parentElement !== mainContent) {
-				if ((el.parentElement.textContent?.trim() || '') !== text) continue;
+				if ((el.parentElement.textContent?.trim() || '') !== text) {
+					if (!firstHeading) continue;
+					if (!(el.compareDocumentPosition(firstHeading) & 4)) continue;
+				}
 			}
 			const link: Element | null = el.matches('a[href]') ? el : el.querySelector('a[href]');
 			if (!link) continue;
@@ -453,6 +564,48 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 		}
 	}
 
+	// Remove trailing "related posts" blocks — a container at the end of content
+	// whose children are all short, link-dense paragraphs with no prose sentences.
+	// Pattern: <section>/<div>/<aside> containing only <p> elements where each
+	// paragraph is mostly links (article title + category tags, no prose).
+	let lastChild = mainContent.lastElementChild;
+	while (lastChild && ['HR', 'BR'].includes(lastChild.tagName)) {
+		lastChild = lastChild.previousElementSibling;
+	}
+	if (lastChild && ['SECTION', 'DIV', 'ASIDE'].includes(lastChild.tagName)) {
+		const paras: Element[] = [];
+		let hasNonPara = false;
+		for (const child of lastChild.children) {
+			const text = child.textContent?.trim() || '';
+			if (!text) continue;
+			if (child.tagName === 'P') paras.push(child);
+			else if (child.tagName !== 'BR') { hasNonPara = true; break; }
+		}
+		if (paras.length >= 2 && !hasNonPara) {
+			const allLinkDense = paras.every(p => {
+				const text = (p.textContent?.trim() || '').replace(/\s+/g, ' ');
+				const links = p.querySelectorAll('a[href]');
+				if (links.length === 0) return false;
+				let linkTextLen = 0;
+				for (const link of links) linkTextLen += (link.textContent?.trim() || '').length;
+				if (linkTextLen / (text.length || 1) <= 0.6) return false;
+				let nonLinkText = text;
+				for (const link of links) nonLinkText = nonLinkText.split(link.textContent?.trim() || '').join('');
+				return !/[.!?]/.test(nonLinkText);
+			});
+			if (allLinkDense) {
+				if (debug && debugRemovals) {
+					debugRemovals.push({
+						step: 'removeByContentPattern',
+						reason: 'trailing related posts block',
+						text: textPreview(lastChild)
+					});
+				}
+				lastChild.remove();
+			}
+		}
+	}
+
 	// Remove trailing thin sections — the last few direct children of
 	// mainContent that contain a heading but very little prose. These are
 	// typically CTAs, newsletter prompts, or promotional sections that
@@ -506,7 +659,7 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 		if (!el.parentNode) continue;
 		const text = el.textContent?.trim() || '';
 		const words = countWords(text);
-		if (words > 50 || words < 3) continue;
+		if (words > 50 || words < 1) continue;
 
 		for (const pattern of BOILERPLATE_PATTERNS) {
 			if (pattern.test(text)) {
@@ -522,7 +675,22 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 				// Only truncate if there's substantial content before the boilerplate
 				const targetText = target.textContent || '';
 				const targetPos = fullText.indexOf(targetText);
-				if (targetPos < 200) continue;
+				if (targetPos < 200) {
+					// Walk-up reached a high-level wrapper (targetPos ≈ 0). Can't
+					// safely truncate from there. But if the original element is a
+					// trailing orphan with no following siblings, remove it directly.
+					if (target !== el && !el.nextElementSibling) {
+						if (debug && debugRemovals) {
+							debugRemovals.push({
+								step: 'removeByContentPattern',
+								reason: 'boilerplate text',
+								text: textPreview(el)
+							});
+						}
+						el.remove();
+					}
+					continue;
+				}
 
 				// Collect ancestors before modifying the DOM
 				const ancestors: Element[] = [];
@@ -544,6 +712,101 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 				return;
 			}
 		}
+	}
+
+	// Remove "Related posts" / "Read next" / "About the Author" sections identified by their heading text.
+	for (const heading of mainContent.querySelectorAll('h2, h3, h4, h5, h6')) {
+		if (!heading.parentNode) continue;
+		const headingText = heading.textContent?.trim() || '';
+		if (!RELATED_HEADING_PATTERN.test(headingText)) continue;
+
+		// Must appear after substantial content
+		if (contentText.indexOf(headingText) < 500) continue;
+
+		const target = walkUpIsolated(heading, mainContent);
+
+		// Only remove if we walked up to a container (not the heading itself).
+		// If the heading is directly in the article body, target remains the heading — skip.
+		if (target === heading) continue;
+
+		removeThinPrecedingSection(target, debug, debugRemovals);
+
+		if (debug && debugRemovals) {
+			debugRemovals.push({ step: 'removeByContentPattern', reason: 'related content section', text: textPreview(target) });
+		}
+		removeTrailingSiblings(target, true, debug, debugRemovals);
+		break;
+	}
+
+	// Remove related post card grids that lack a detectable heading
+	// (e.g. the heading was removed by removeLowScoring before this step runs).
+	// Matches a container whose children are predominantly image-bearing cards (img + heading).
+	for (const el of mainContent.querySelectorAll('div')) {
+		if (!el.parentNode) continue;
+		if (el.children.length < 2) continue;
+		const children = Array.from(el.children);
+
+		// Each qualifying card must contain both an image and a heading
+		const cardCount = children.filter(c =>
+			c.querySelector('img, picture') && c.querySelector('h2, h3, h4')
+		).length;
+		if (cardCount < 2 || cardCount < children.length * 0.7) continue;
+
+		// Must appear after substantial content (not a top-of-page listing)
+		const firstText = children[0].textContent?.trim().substring(0, 30) || '';
+		if (firstText.length < 5 || contentText.indexOf(firstText) < 500) continue;
+
+		const target = walkUpIsolated(el, mainContent);
+		if (target === el) continue;
+
+		removeThinPrecedingSection(target, debug, debugRemovals);
+
+		if (debug && debugRemovals) {
+			debugRemovals.push({ step: 'removeByContentPattern', reason: 'related post cards', text: textPreview(target) });
+		}
+		removeTrailingSiblings(target, true, debug, debugRemovals);
+		break;
+	}
+
+	// Remove newsletter signup sections identified by their text content.
+	// Catches signup forms whose class names are hashed (e.g. Chakra UI apps)
+	// after the <form> element itself has been removed by selector removal.
+	// Note: textContent in some DOM implementations (e.g. linkedom) concatenates adjacent
+	// element text without whitespace, so we normalize camelCase boundaries before matching.
+	for (const el of mainContent.querySelectorAll('div, section, aside')) {
+		if (!el.parentNode) continue;
+		if (el.closest('pre, code')) continue;
+		if (!isNewsletterElement(el, 60)) continue;
+
+		// Walk up while the parent doesn't have significantly more content
+		// (i.e. the newsletter is the only or near-only child).
+		const elWords = countWords(el.textContent?.trim() || '');
+		let target: Element = el;
+		while (target.parentElement && target.parentElement !== mainContent) {
+			const parentWords = countWords(target.parentElement.textContent?.trim() || '');
+			if (parentWords > elWords * 2 + 15) break;
+			target = target.parentElement;
+		}
+
+		if (debug && debugRemovals) {
+			debugRemovals.push({ step: 'removeByContentPattern', reason: 'newsletter signup', text: textPreview(target) });
+		}
+		target.remove();
+		break;
+	}
+
+	// Remove newsletter signup lists — <ul> elements whose only content is
+	// newsletter signup links (e.g. Guardian standfirst). These are siblings
+	// of real content so we remove the list directly without walking up.
+	for (const el of mainContent.querySelectorAll('ul')) {
+		if (!el.parentNode) continue;
+		if (!isNewsletterElement(el, 30)) continue;
+
+		if (debug && debugRemovals) {
+			debugRemovals.push({ step: 'removeByContentPattern', reason: 'newsletter signup list', text: textPreview(el) });
+		}
+		el.remove();
+		break;
 	}
 
 }

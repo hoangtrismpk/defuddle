@@ -187,20 +187,43 @@ export const codeBlockRules = [
 				return '';
 			};
 
-			// Try to get the language from the element and its ancestors
+			// Try to get the language from the element and its ancestors.
+			// Only search inside the element itself (not ancestors) to avoid
+			// picking up language from already-processed sibling code blocks.
 			let language = '';
 			let currentElement: Element | null = el;
-			
+
 			while (currentElement && !language) {
 				language = getCodeLanguage(currentElement);
-				
-				// Also check for code elements within the current element
-				const codeEl = currentElement.querySelector('code');
-				if (!language && codeEl) {
-					language = getCodeLanguage(codeEl);
+
+				if (!language && currentElement === el) {
+					// Prefer a code element that already has language attributes;
+					// fall back to the first code element if none found.
+					// (In table-based layouts like Hugo/Chroma, the first <code>
+					// is the line-number column and has no language attribute.)
+					const codeEl = currentElement.querySelector('code[data-lang], code[class*="language-"]')
+						|| currentElement.querySelector('code');
+					if (codeEl) {
+						language = getCodeLanguage(codeEl);
+					}
 				}
-				
+
 				currentElement = currentElement.parentElement;
+			}
+
+			// Detect CodeMirror-based code blocks (e.g. ChatGPT's runnable code blocks).
+			// The language is only in the header text, not in class/data attributes.
+			const cmContent = el.querySelector('.cm-content');
+			if (cmContent && !language) {
+				const allDivs = Array.from(el.querySelectorAll('div'));
+				for (const div of allDivs) {
+					if (div.contains(cmContent)) continue; // skip code area and its ancestors
+					const text = (div.textContent || '').trim().toLowerCase();
+					if (text && CODE_LANGUAGES.has(text)) {
+						language = text;
+						break;
+					}
+				}
 			}
 
 			// Extract content from WordPress syntax highlighter
@@ -261,9 +284,45 @@ export const codeBlockRules = [
 						return '';
 					}
 
-					// Handle explicit line breaks
+					// Handle explicit line breaks.
+					// Skip <br> that immediately follows a line-based span (e.g. Hexo/Highlight.js
+					// `<span class="line">CODE</span><br>`) — the line span already appended '\n'.
 					if (element.tagName === 'BR') {
+						const prev = element.previousElementSibling;
+						if (prev && prev.matches('div[class*="line"], span[class*="line"], .ec-line, [data-line-number], [data-line]')) {
+							return '';
+						}
 						return '\n';
+					}
+
+					// Hugo/Chroma line-number spans (<span class="lnt">1\n</span>) live in a
+					// separate table column from the code; skip them entirely.
+					if (element.matches('span.lnt')) {
+						return '';
+					}
+
+					// react-syntax-highlighter inline line number spans are interspersed
+					// directly in the code content; skip them.
+					if (element.matches('.react-syntax-highlighter-line-number')) {
+						return '';
+					}
+
+					// Rouge (Jekyll) line-number gutter lives in a separate table cell;
+					// skip it so only the code column is extracted.
+					if (element.matches('.rouge-gutter')) {
+						return '';
+					}
+
+					// Two-child div/span where the first child is all-digits (line number gutter).
+					// Some code viewers render each line as a row with a numeric gutter in
+					// the first child and the actual code in the second (e.g. flex-row layout,
+					// or Chroma inline line numbers: <span style="display:flex"><span>N</span><span>code</span></span>).
+					// Without this, extractStructuredText concatenates them as "1AGENTS.md".
+					if ((element.tagName === 'DIV' || element.tagName === 'SPAN') && element.children.length === 2) {
+						const gutter = (element.children[0].textContent || '').trim();
+						if (/^\d+$/.test(gutter)) {
+							return extractStructuredText(element.children[1]).replace(/\n$/, '') + '\n';
+						}
 					}
 
 					// Handle common line-based code formats
@@ -274,7 +333,7 @@ export const codeBlockRules = [
 						// 1. A dedicated code container
 						const codeContainer = element.querySelector('.code, .content, [class*="code-"], [class*="content-"]');
 						if (codeContainer) {
-							return (codeContainer.textContent || '') + '\n';
+							return (codeContainer.textContent || '').replace(/\n$/, '') + '\n';
 						}
 						
 						// 2. Line number is in a separate element
@@ -284,11 +343,11 @@ export const codeBlockRules = [
 								.filter(node => !lineNumber.contains(node))
 								.map(node => extractStructuredText(node))
 								.join('');
-							return withoutLineNum + '\n';
+							return withoutLineNum.replace(/\n$/, '') + '\n';
 						}
 						
 						// 3. Fallback to the entire line content
-						return element.textContent + '\n';
+						return (element.textContent || '').replace(/\n$/, '') + '\n';
 					}
 					
 					element.childNodes.forEach(child => {
@@ -303,9 +362,13 @@ export const codeBlockRules = [
 			if (el.matches('.syntaxhighlighter, .wp-block-syntaxhighlighter-code')) {
 				codeContent = extractWordPressContent(el);
 			}
-			
-			// If no content extracted from WordPress format, use structured text extraction
-			if (!codeContent) {
+
+			// If no content extracted from WordPress format, use structured text extraction.
+			// For CodeMirror blocks (e.g. ChatGPT runnable snippets), only extract from
+			// .cm-content to avoid mixing in UI chrome (header, copy/run buttons).
+			if (!codeContent && cmContent) {
+				codeContent = extractStructuredText(cmContent);
+			} else if (!codeContent) {
 				codeContent = extractStructuredText(el);
 			}
 

@@ -17,6 +17,7 @@ export const ENTRY_POINT_ELEMENTS = [
 	'[role="article"]',
 	'main',
 	'[role="main"]',
+	'.article-body',
 	'#content',
 	'body' // ensures there is always a match
 ];
@@ -94,6 +95,9 @@ export const EXACT_SELECTORS = [
 	'meta',
 	'link',
 
+	// empty media elements (src set by JS at runtime, not in raw HTML)
+	'audio:not([src])',
+
 	// ads
 	'.ad:not([class*="gradient"])',
 	'[class^="ad-" i]',
@@ -115,8 +119,13 @@ export const EXACT_SELECTORS = [
 	'div[class*="cover-"]',
 	'div[id*="cover-"]',
 
+	// breadcrumbs (custom web component tag)
+	'ads-breadcrumbs',
+
 	// header, nav
-	'header',
+	// Exclude headers that contain paragraph text — some sites (e.g. Webflow blogs)
+	// use <header> as the main content wrapper rather than a navigation container.
+	'header:not(:has(p))',
 	'.header:not(.banner)',
 	'#header',
 	'#Header',
@@ -271,6 +280,7 @@ export const EXACT_SELECTORS_JOINED = EXACT_SELECTORS.join(',');
 export const TEST_ATTRIBUTES = [
 	'class',
 	'id',
+	'data-component',
 	'data-test',
 	'data-testid',
 	'data-test-id',
@@ -282,7 +292,7 @@ export const TEST_ATTRIBUTES = [
 // Case insensitive, partial matches allowed
 export const PARTIAL_SELECTORS = [
 	'a-statement',
-	'access-wall',
+	'(?<!main-)access-wall', // avoid matching data-test="main-access-wall" (content container)
 	'activitypub',
 	'actioncall',
 	'addcomment',
@@ -347,6 +357,7 @@ export const PARTIAL_SELECTORS = [
 	'article--lede', // The Verge
 	'articlewell',
 	'associated-people',
+	'ambient-video__button',
 	'audio-card',
 //	'author', Gwern
 //	'-author',
@@ -414,6 +425,7 @@ export const PARTIAL_SELECTORS = [
 	'consent',
 	'contact-',
 	'content-card', // The Verge
+	'copycontent',
 	'content-topics',
 	'contentpromo',
 	'context-bar',
@@ -447,6 +459,8 @@ export const PARTIAL_SELECTORS = [
 	'donation',
 	'dropdown', // Ars Technica
 
+	'editorial_contact',
+	'editorial-contact',
 	'element-invisible',
 	'eletters',
 	'emailsignup',
@@ -567,6 +581,7 @@ export const PARTIAL_SELECTORS = [
 	'menu-',
 //	'meta-', syntax highlighting
 	'metadata',
+	'meta-bottom',
 	'meta-date',
 	'meta-row',
 	'might-like',
@@ -627,6 +642,7 @@ export const PARTIAL_SELECTORS = [
 //	'popover',
 	'pop_stories',
 	'pop-up',
+	'post__author',
 	'post-author',
 	'post-bottom',
 	'post__category',
@@ -739,6 +755,7 @@ export const PARTIAL_SELECTORS = [
 	'share-post',
 	'share-print',
 	'share-section',
+	'sharing_',
 	'shariff-',
 	'show-for-print',
 	'sidebartitle',
@@ -796,9 +813,11 @@ export const PARTIAL_SELECTORS = [
 	'_tags',
 	'tags__item',
 	'tag_list',
+	'tag-list',
 	'taxonomy',
 //	'table-content',
 	'table-of-contents',
+	'tblc',
 	'tabs-',
 //	'teaser', Nature
 	'terminaltout',
@@ -815,6 +834,7 @@ export const PARTIAL_SELECTORS = [
 //	'toolbar', prism.js
 	'tooltip-content',
 	'topbar',
+	'subnavbar',
 	'topic-authors',
 	'topic-footer',
 	'topic-list',
@@ -826,17 +846,23 @@ export const PARTIAL_SELECTORS = [
 	'trust-feat',
 	'trust-badge',
 	'trust-project',
+	'chakra-badge',
 	'twitter',
+	'twiblock',
 
 	'u-hide',
 	'upsell',
 
 	'viewbottom',
+	'view-language',
 	'yarpp-related',
 	'visually-hidden',
 	'welcomebox',
 	'widget_pages',
 //	'widget-'
+	// Webflow form state messages — shown after form submit, never article content
+	'w-form-done',
+	'w-form-fail',
 ];
 
 // Pre-compiled combined regex for PARTIAL_SELECTORS — avoids rebuilding on every parse
@@ -888,7 +914,9 @@ export const FOOTNOTE_LIST_SELECTORS = [
 	'ul.footnotes-list',
 	'ul.ltx_biblist',
 	'div.footnote[data-component-name="FootnoteToDOM"]', // Substack
-	'div.footnotes-footer' // Wikidot
+	'div.footnotes-footer', // Wikidot
+	'div.footnote-definitions',
+	'#footnotes' // standardizeFootnotes output container
 ].join(',');
 
 // Elements that are allowed to be empty

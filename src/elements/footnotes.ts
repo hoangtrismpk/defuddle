@@ -1,5 +1,7 @@
 import { FOOTNOTE_LIST_SELECTORS, FOOTNOTE_INLINE_REFERENCES } from '../constants';
 import { transferContent, parseHTML, serializeHTML } from '../utils/dom';
+import { isElement, isTextNode } from '../utils';
+import { removeOrphanedDividers } from '../standardize';
 
 // Matches heading text for loose footnote section delimiters
 const FOOTNOTE_SECTION_RE = /^(foot\s*notes?|end\s*notes?|notes?|references?)$/i;
@@ -19,6 +21,7 @@ class FootnoteHandler {
 	private doc: any;
 	private genericContainer: any = null;
 	private genericElements: any[] = [];
+	private extraContainersToRemove: any[] = [];
 
 	constructor(doc: any) {
 		this.doc = doc;
@@ -40,18 +43,28 @@ class FootnoteHandler {
 			paragraph.appendChild(parseHTML(doc, content));
 			newItem.appendChild(paragraph);
 		} else {
+			const BLOCK_TAGS = new Set(['div', 'section', 'article', 'aside', 'blockquote', 'dl', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'main', 'nav', 'ol', 'p', 'pre', 'table', 'ul']);
 			const children = Array.from(content.children) as any[];
 			const hasParagraphs = children.some((c: any) => c.tagName.toLowerCase() === 'p');
-			if (!hasParagraphs) {
-				// No paragraph structure — wrap all content (including text nodes) in a single paragraph
+			const hasBlockChildren = children.some((c: any) => BLOCK_TAGS.has(c.tagName.toLowerCase()));
+			if (!hasParagraphs && !hasBlockChildren) {
+				// No paragraph or block structure — wrap all content (including text nodes) in a single paragraph
 				const paragraph = doc.createElement('p');
 				transferContent(content, paragraph);
 				this.removeBackrefs(paragraph);
 				newItem.appendChild(paragraph);
+			} else if (!hasParagraphs && hasBlockChildren) {
+				// Block children but no paragraphs — append directly to avoid <p><div> invalid nesting
+				children.forEach((child: any) => {
+					const clone = child.cloneNode(true);
+					this.removeBackrefs(clone);
+					newItem.appendChild(clone);
+				});
 			} else {
 				// Copy direct children in order, preserving non-paragraph elements (lists, blockquotes, etc.)
 				children.forEach((child: any) => {
 					if (child.tagName.toLowerCase() === 'p') {
+						if (!child.textContent?.trim() && !child.querySelector('img, br')) return;
 						const newP = doc.createElement('p');
 						transferContent(child, newP);
 						this.removeBackrefs(newP);
@@ -119,6 +132,34 @@ class FootnoteHandler {
 						}
 					}
 				});
+				return;
+			}
+
+			// Hugo/org-mode: div.footnote-definitions containing div.footnote-definition children
+			// Each child: <sup id="footnote-N"><a href="#footnote-reference-N">N</a></sup>
+			//              <div class="footnote-body"><p>content</p></div>
+			if (list.matches('div.footnote-definitions')) {
+				const defs = list.querySelectorAll('div.footnote-definition');
+				defs.forEach((def: any) => {
+					const supEl = def.querySelector('sup[id]');
+					const body = def.querySelector('.footnote-body');
+					if (!supEl || !body) return;
+					const id = (supEl.id || '').toLowerCase();
+					if (!id || processedIds.has(id)) return;
+					footnotes[footnoteCount] = {
+						content: body.cloneNode(true),
+						originalId: id,
+						refs: []
+					};
+					processedIds.add(id);
+					footnoteCount++;
+				});
+				// Also schedule the parent wrapper (e.g. div.footnotes) for removal
+				// so the <hr> separator inside it doesn't remain in the output.
+				const parent = list.parentElement;
+				if (parent && parent !== element && parent.classList?.contains('footnotes')) {
+					this.extraContainersToRemove.push(parent);
+				}
 				return;
 			}
 
@@ -199,12 +240,6 @@ class FootnoteHandler {
 				const text = a.textContent?.trim() || '';
 				if (!/^\[?\(?\d{1,4}\)?\]?$/.test(text)) return;
 
-				// Must be inside a sup or span to look like a footnote ref
-				const parent = a.parentElement;
-				if (!parent) return;
-				const parentTag = parent.tagName.toLowerCase();
-				if (parentTag !== 'sup' && parentTag !== 'span' && a.tagName.toLowerCase() !== 'a') return;
-
 				if (!candidateRefs.has(fragment)) {
 					candidateRefs.set(fragment, []);
 				}
@@ -218,7 +253,7 @@ class FootnoteHandler {
 				let bestContainer: any = null;
 				let bestMatchCount = 0;
 
-				containers.forEach((container: any) => {
+					containers.forEach((container: any) => {
 					// Skip containers that are the main content element itself
 					if (container === element) return;
 
@@ -230,8 +265,21 @@ class FootnoteHandler {
 				});
 
 				if (bestContainer) {
-					// Step 3: Extract footnotes from the container in document order
+					// Validate: require >=75% of external candidate refs (anchors outside the container,
+					// i.e. not back-links) to point to footnote elements in this container.
+					// This prevents equation/theorem cross-references in the body from being
+					// mis-classified as footnotes when only a subset link to any one container.
 					const orderedElements = this.findMatchingFootnoteElements(bestContainer, fragmentSet);
+					const footnoteFragments = new Set(orderedElements.map(({ id }) => id));
+					let externalTotal = 0, externalMatch = 0;
+					candidateRefs.forEach((anchors: any[], frag: string) => {
+						if (anchors.some((a: any) => bestContainer.contains(a))) return; // back-link
+						externalTotal++;
+						if (footnoteFragments.has(frag)) externalMatch++;
+					});
+					if (externalMatch < Math.max(2, Math.ceil(externalTotal * 0.75))) bestContainer = null;
+
+					// Step 3: Extract footnotes from the container in document order
 
 					// Step 4: Handle multi-paragraph footnotes (group consecutive non-ID elements)
 					orderedElements.forEach(({ el, id }) => {
@@ -242,15 +290,22 @@ class FootnoteHandler {
 						const clone = el.cloneNode(true);
 
 						// Remove any empty child anchor used as an ID marker (e.g. <a id="r1"></a>)
+						// Also remove anchors whose text is just a numeric marker (e.g. <a id="r1">1.</a>)
 						const idAnchor = clone.querySelector(`a[id="${id}"]`);
-						if (idAnchor && !idAnchor.textContent?.trim()) {
+						if (idAnchor && (!idAnchor.textContent?.trim() || /^\d+[.)]*\s*$/.test(idAnchor.textContent.trim()))) {
 							idAnchor.remove();
 						}
 
-						// Strip leading footnote number (e.g. "1. " or "1 ")
+						// Remove named anchor footnote marker (e.g. Gutenberg: <a name="Footnote_4">4</a>)
+						const namedAnchor = clone.querySelector('a[name]');
+						if (namedAnchor && namedAnchor.getAttribute('name')?.toLowerCase() === id) {
+							namedAnchor.remove();
+						}
+
+						// Strip leading footnote number (e.g. "1. " or "1 ") or whitespace left by removed anchor
 						const firstText = clone.childNodes[0];
 						if (firstText && firstText.nodeType === 3) {
-							firstText.textContent = firstText.textContent.replace(/^\d+\.\s*/, '');
+							firstText.textContent = firstText.textContent.replace(/^\d+\.\s*/, '').replace(/^\s+/, '');
 						}
 
 						// For list items, extract children into contentDiv to avoid <p><li>...</li></p> nesting
@@ -264,8 +319,8 @@ class FootnoteHandler {
 						let sibling = el.nextElementSibling;
 						while (sibling && !sibling.id) {
 							// Stop if this sibling starts a new anchored footnote
-							const sibAnchor = sibling.querySelector('a[id]');
-							if (sibAnchor && fragmentSet.has(sibAnchor.id.toLowerCase())) break;
+							const sibAnchorId = this.getChildAnchorId(sibling);
+							if (sibAnchorId && fragmentSet.has(sibAnchorId)) break;
 							const sibClone = sibling.cloneNode(true);
 							contentDiv.appendChild(sibClone);
 							sibling = sibling.nextElementSibling;
@@ -283,6 +338,53 @@ class FootnoteHandler {
 					// Step 5: Store container for later removal
 					this.genericContainer = bestContainer;
 				}
+			}
+		}
+
+		// Microsoft Word HTML export: body refs use href="#_ftn[N]",
+		// footnote list items contain back-links href="..#_ftnref[N]" (no IDs on elements).
+		if (footnoteCount === 1) {
+			const wordBackrefs = Array.from(element.querySelectorAll('a[href*="#_ftnref"]'));
+			if (wordBackrefs.length >= 2) {
+				const pairs: Array<{num: number, anchor: any}> = [];
+				wordBackrefs.forEach((anchor: any) => {
+					const href = anchor.getAttribute('href') || '';
+					const fragment = href.split('#').pop() || '';
+					const match = fragment.match(/^_ftnref(\d+)$/);
+					if (match) pairs.push({ num: parseInt(match[1]), anchor });
+				});
+				pairs.sort((a, b) => a.num - b.num);
+
+				pairs.forEach(({ num, anchor }) => {
+					const originalId = `_ftn${num}`;
+					if (processedIds.has(originalId)) return;
+
+					// Walk up to the containing block element (p, div, li)
+					let container: any = anchor.parentElement;
+					while (container && container !== element) {
+						const tag = container.tagName.toLowerCase();
+						if (tag === 'p' || tag === 'div' || tag === 'li') break;
+						container = container.parentElement;
+					}
+					if (!container || container === element) return;
+
+					// Clone and strip the back-ref marker (the sup containing the anchor)
+					const clone = container.cloneNode(true) as any;
+					const backrefAnchor = clone.querySelector('a[href*="_ftnref"]');
+					if (backrefAnchor) {
+						const wrapSup = backrefAnchor.closest('sup');
+						if (wrapSup) wrapSup.remove();
+						else backrefAnchor.remove();
+					}
+
+					const contentDiv = element.ownerDocument.createElement('div');
+					contentDiv.appendChild(clone);
+
+					footnotes[num] = { content: contentDiv, originalId, refs: [] };
+					processedIds.add(originalId);
+					if (num >= footnoteCount) footnoteCount = num + 1;
+					this.genericElements.push(container);
+				});
 			}
 		}
 
@@ -456,6 +558,13 @@ class FootnoteHandler {
 		}
 	}
 
+	// Returns the lowercase ID from a child anchor, checking a[id] then a[name].
+	getChildAnchorId(el: any): string {
+		const anchor = el.querySelector('a[id], a[name]');
+		if (!anchor) return '';
+		return (anchor.id || anchor.getAttribute('name') || '').toLowerCase();
+	}
+
 	// Returns elements within container whose IDs (direct or via child anchor) are in fragmentSet,
 	// in document order, deduplicated.
 	findMatchingFootnoteElements(container: any, fragmentSet: Set<string>): Array<{el: any, id: string}> {
@@ -466,10 +575,8 @@ class FootnoteHandler {
 			if (el.id && fragmentSet.has(el.id.toLowerCase())) {
 				id = el.id.toLowerCase();
 			} else if (!el.id) {
-				const anchor = el.querySelector('a[id]');
-				if (anchor && fragmentSet.has(anchor.id.toLowerCase())) {
-					id = anchor.id.toLowerCase();
-				}
+				const anchorId = this.getChildAnchorId(el);
+				if (anchorId && fragmentSet.has(anchorId)) id = anchorId;
 			}
 			if (id && !seen.has(id)) {
 				results.push({ el, id });
@@ -521,7 +628,16 @@ class FootnoteHandler {
 	collectInlineSidenotes(element: any): FootnoteCollection {
 		const footnotes: FootnoteCollection = {};
 		const containers = element.querySelectorAll('span.footnote-container, span.sidenote-container, span.inline-footnote');
-		if (containers.length === 0) return footnotes;
+
+		// Remove standalone sidenote spans that aren't inside a handled container.
+		// These appear as siblings of footnote reference sups (e.g. Hugo/org-mode sites)
+		// and duplicate content already in the formal footnote list.
+		if (containers.length === 0) {
+			element.querySelectorAll('span.sidenote').forEach((sidenote: any) => {
+				sidenote.remove();
+			});
+			return footnotes;
+		}
 
 		let footnoteCount = 1;
 		containers.forEach((container: any) => {
@@ -547,11 +663,64 @@ class FootnoteHandler {
 		return footnotes;
 	}
 
+	/**
+	 * Collects footnotes from asides containing numbered ordered lists.
+	 * Pattern: <aside><ol start="N"><li>Content…</li></ol></aside>
+	 * with bare <sup>N</sup> inline refs in the surrounding text.
+	 * Asides are removed from the DOM; the Pass 2 fallback in standardizeFootnotes
+	 * matches the bare <sup>N</sup> refs to the collected footnotes.
+	 */
+	collectAsideFootnotes(element: any): FootnoteCollection {
+		const footnotes: FootnoteCollection = {};
+
+		const ols = Array.from(element.querySelectorAll('aside > ol[start]')) as any[];
+		if (ols.length === 0) return footnotes;
+
+		ols.forEach((ol: any) => {
+			const aside = ol.parentElement;
+			const footnoteNumber = parseInt(ol.getAttribute('start') || '', 10);
+			if (isNaN(footnoteNumber) || footnoteNumber < 1) return;
+
+			const items = Array.from(ol.querySelectorAll('li')) as any[];
+			if (items.length === 0) return;
+
+			const contentDiv = this.doc.createElement('div');
+			if (items.length === 1) {
+				transferContent(items[0].cloneNode(true), contentDiv);
+			} else {
+				items.forEach((li: any) => {
+					const p = this.doc.createElement('p');
+					transferContent(li.cloneNode(true), p);
+					contentDiv.appendChild(p);
+				});
+			}
+
+			footnotes[footnoteNumber] = {
+				content: contentDiv,
+				originalId: String(footnoteNumber),
+				refs: []
+			};
+
+			aside.remove();
+		});
+
+		return footnotes;
+	}
+
 	standardizeFootnotes(element: any) {
 		// Handle CSS sidenote footnotes first
 		const sidenotes = this.collectInlineSidenotes(element);
 
 		const footnotes = this.collectFootnotes(element);
+
+		// Merge aside footnotes; don't overwrite footnotes already collected
+		const asideFootnotes = this.collectAsideFootnotes(element);
+		for (const [num, data] of Object.entries(asideFootnotes)) {
+			const n = parseInt(num);
+			if (!footnotes[n]) {
+				footnotes[n] = data;
+			}
+		}
 
 		// Standardize inline footnotes using the collected IDs
 		const footnoteInlineReferences = element.querySelectorAll(FOOTNOTE_INLINE_REFERENCES);
@@ -698,8 +867,26 @@ class FootnoteHandler {
 						const group = supGroups.get(container);
 						group.push(this.createFootnoteReference(footnoteNumber, refId));
 					} else {
-						// Replace the container directly
-						container.replaceWith(this.createFootnoteReference(footnoteNumber, refId));
+						// If the container has both direct text nodes and child elements,
+						// the text nodes are meaningful visible content (e.g. a year "1799"
+						// used as anchor text) while child elements hold the hidden footnote mark.
+						// Preserve the visible text alongside the footnote reference.
+						let directText = '';
+						let hasChildElements = false;
+						for (const node of container.childNodes) {
+							if (isTextNode(node)) directText += node.textContent || '';
+							else if (isElement(node)) hasChildElements = true;
+						}
+						directText = directText.trim();
+
+						if (directText && hasChildElements) {
+							const fragment = container.ownerDocument.createDocumentFragment();
+							fragment.appendChild(container.ownerDocument.createTextNode(directText));
+							fragment.appendChild(this.createFootnoteReference(footnoteNumber, refId));
+							container.replaceWith(fragment);
+						} else {
+							container.replaceWith(this.createFootnoteReference(footnoteNumber, refId));
+						}
 					}
 				}
 			}
@@ -846,6 +1033,16 @@ class FootnoteHandler {
 		this.genericElements.forEach((el: any) => {
 			if (el.parentNode) el.remove();
 		});
+
+		// Remove outer wrapper containers tracked during collection
+		// (e.g. div.footnotes wrapping a div.footnote-definitions)
+		this.extraContainersToRemove.forEach((el: any) => {
+			if (el.parentNode) el.remove();
+		});
+
+		// Strip trailing <hr> left behind after footnote list removal
+		// (section separator no longer needed since we append our own standardized list)
+		removeOrphanedDividers(element);
 
 		// If we have any footnotes, add the new list to the document
 		if (orderedList.children.length > 0) {

@@ -1,4 +1,4 @@
-import { BaseExtractor } from './_base';
+import { BaseExtractor, ExtractorOptions } from './_base';
 import { ExtractorResult } from '../types/extractors';
 import { escapeHtml } from '../utils/dom';
 import { countWords } from '../utils';
@@ -31,7 +31,7 @@ const INNERTUBE_WEB_CONTEXT = {
 	}
 };
 
-type TranscriptResult = { html: string; text: string; languageCode: string };
+type TranscriptResult = { html: string; text: string; languageCode?: string };
 
 interface TranscriptSelectors {
 	segments: string;
@@ -58,8 +58,8 @@ export class YoutubeExtractor extends BaseExtractor {
 	private inlineJsonCache = new Map<string, any>();
 	protected override schemaOrgData: any;
 
-	constructor(document: Document, url: string, schemaOrgData?: any) {
-		super(document, url, schemaOrgData);
+	constructor(document: Document, url: string, schemaOrgData?: any, options?: ExtractorOptions) {
+		super(document, url, schemaOrgData, options);
 		this.videoElement = document.querySelector('video');
 		this.schemaOrgData = schemaOrgData;
 	}
@@ -81,10 +81,38 @@ export class YoutubeExtractor extends BaseExtractor {
 	}
 
 	async extractAsync(): Promise<ExtractorResult> {
-		const transcript = this.extractTranscriptFromExistingDom()
-			|| await this.fetchTranscript()
-			|| await this.extractTranscriptFromOpenedDom();
+		const existingTranscript = this.extractTranscriptFromExistingDom();
+		const transcript = this.shouldUseExistingDomTranscript(existingTranscript)
+			? existingTranscript
+			: await this.fetchTranscript()
+				|| existingTranscript
+				|| await this.extractTranscriptFromOpenedDom();
 		return this.buildResult(transcript);
+	}
+
+	private normalizeLanguageCode(code?: string): string {
+		return (code || '').trim().replace(/_/g, '-').toLocaleLowerCase();
+	}
+
+	// True if languageCode satisfies preferredLang:
+	// - exact match (zh-CN === zh-CN), or
+	// - same base AND at least one side is just the base (zh matches zh-CN, zh-CN matches zh)
+	// Does NOT match across regional variants (zh-Hant does not satisfy zh-CN) —
+	// use findPreferredCaptionTrack for the more permissive API-path matching.
+	private languageCodeMatchesPreference(languageCode?: string, preferredLang?: string): boolean {
+		const a = this.normalizeLanguageCode(languageCode);
+		const b = this.normalizeLanguageCode(preferredLang);
+		if (!a || !b) return false;
+		if (a === b) return true;
+		const aBase = a.split('-')[0];
+		const bBase = b.split('-')[0];
+		return aBase === bBase && (a === aBase || b === bBase);
+	}
+
+	private shouldUseExistingDomTranscript(transcript?: TranscriptResult): boolean {
+		if (!transcript) return false;
+		if (!this.options.language) return true;
+		return this.languageCodeMatchesPreference(transcript.languageCode, this.options.language);
 	}
 
 	private getCaptionTracks(playerData: any): any[] {
@@ -92,10 +120,22 @@ export class YoutubeExtractor extends BaseExtractor {
 		return Array.isArray(captionTracks) ? captionTracks : [];
 	}
 
+	// More permissive than languageCodeMatchesPreference: also matches across regional variants
+	// (zh-Hant satisfies zh-CN) as a last resort, since any Chinese is better than English.
+	private findPreferredCaptionTrack(captionTracks: any[], preferredLang?: string): any | undefined {
+		const norm = this.normalizeLanguageCode(preferredLang);
+		if (!norm) return undefined;
+		const base = norm.split('-')[0];
+		const normalized = captionTracks.map(t => ({ t, code: this.normalizeLanguageCode(t.languageCode) }));
+		return (normalized.find(({ code }) => code === norm)
+			?? normalized.find(({ code }) => code === base)
+			?? normalized.find(({ code }) => code.split('-')[0] === base))?.t;
+	}
+
 	private pickCaptionTrack(captionTracks: any[]): any | undefined {
 		const preferredLang = this.options.language;
 		if (preferredLang) {
-			const match = captionTracks.find((track: any) => track.languageCode === preferredLang);
+			const match = this.findPreferredCaptionTrack(captionTracks, preferredLang);
 			if (match) return match;
 		}
 		return captionTracks.find((track: any) => track.languageCode === 'en') || captionTracks[0];
@@ -115,16 +155,16 @@ export class YoutubeExtractor extends BaseExtractor {
 			.toLocaleLowerCase();
 	}
 
-	private getTranscriptLanguageCodeFromDom(): string {
+	private getTranscriptLanguageCodeFromDom(): string | undefined {
 		const langButton = this.document.querySelector(
 			'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"] #footer yt-sort-filter-sub-menu-renderer yt-dropdown-menu button'
 		);
 		const selectedLabel = langButton?.textContent?.trim();
-		const captionTracks = this.getCaptionTracks(this.parseInlineJson('ytInitialPlayerResponse'));
-		const preferredTrack = this.pickCaptionTrack(captionTracks);
+		const captionTracks = this.getCaptionTracks(this.getValidatedPlayerResponse());
+		const onlyTrack = captionTracks.length === 1 ? captionTracks[0] : undefined;
 
 		if (!selectedLabel) {
-			return preferredTrack?.languageCode || 'en';
+			return onlyTrack?.languageCode;
 		}
 
 		const normalizedSelectedLabel = this.normalizeLanguageLabel(selectedLabel);
@@ -132,12 +172,21 @@ export class YoutubeExtractor extends BaseExtractor {
 			this.normalizeLanguageLabel(this.getTrackDisplayName(track)) === normalizedSelectedLabel
 		);
 
-		return matchingTrack?.languageCode || preferredTrack?.languageCode || 'en';
+		return matchingTrack?.languageCode || onlyTrack?.languageCode;
 	}
 
 	private getInlineChapters(): { title: string; start: number }[] {
+		const videoId = this.getVideoId();
 		const inlineData = this.parseInlineJson('ytInitialData');
 		if (!inlineData) return [];
+
+		// After YouTube SPA navigation, ytInitialData is stale from the previous page load.
+		// Validate it belongs to the current video before using it.
+		if (videoId) {
+			const currentVideoId = inlineData?.currentVideoEndpoint?.watchEndpoint?.videoId;
+			const endpointVideoId = inlineData?.endpoint?.watchEndpoint?.videoId;
+			if (currentVideoId !== videoId && endpointVideoId !== videoId) return [];
+		}
 
 		const chapters = this.extractChaptersFromPlayerBar(inlineData);
 		if (chapters.length > 0) return chapters;
@@ -287,13 +336,42 @@ export class YoutubeExtractor extends BaseExtractor {
 	}
 
 	private getVideoData(): any {
-		if (!this.schemaOrgData) return {};
+		const videoId = this.getVideoId();
 
-		const videoData = Array.isArray(this.schemaOrgData)
-			? this.schemaOrgData.find(item => item['@type'] === 'VideoObject')
-			: this.schemaOrgData['@type'] === 'VideoObject' ? this.schemaOrgData : null;
+		// Read ld+json directly from the DOM so we can validate it against the current video ID.
+		// schemaOrgData (passed in at construction) may be absent or stale after YouTube SPA
+		// navigation because YouTube removes the VideoObject ld+json block on client-side nav.
+		const scripts = Array.from(this.document.querySelectorAll('script[type="application/ld+json"]'));
+		for (const script of scripts) {
+			try {
+				const data = JSON.parse(script.textContent || '');
+				const items = Array.isArray(data) ? data : [data];
+				const videoObject = items.find((item: any) => {
+					if (item['@type'] !== 'VideoObject') return false;
+					if (!videoId) return true;
+					const id: string = item['@id'] || item['url'] || item['embedUrl'] || '';
+					return id.includes(videoId);
+				});
+				if (videoObject) return videoObject;
+			} catch {
+				// ignore invalid JSON
+			}
+		}
 
-		return videoData || {};
+		// Fall back to og:* meta tags. YouTube updates these after SPA navigation,
+		// so they reliably reflect the current video.
+		if (videoId) {
+			const ogUrl = this.document.querySelector('meta[property="og:url"]')?.getAttribute('content') || '';
+			if (ogUrl.includes(videoId)) {
+				return {
+					name: this.document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '',
+					description: this.document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
+					thumbnailUrl: this.document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
+				};
+			}
+		}
+
+		return {};
 	}
 
 	private getChannelName(videoData: any): string {
@@ -346,16 +424,24 @@ export class YoutubeExtractor extends BaseExtractor {
 	}
 
 	private getChannelNameFromPlayerResponse(): string {
-		const data = this.parseInlineJson('ytInitialPlayerResponse');
+		const data = this.getValidatedPlayerResponse();
 		if (!data) return '';
 
-		const fromVideoDetails = data?.videoDetails?.author || data?.videoDetails?.ownerChannelName;
-		if (fromVideoDetails) {
-			return fromVideoDetails;
-		}
+		return data.videoDetails?.author
+			|| data.videoDetails?.ownerChannelName
+			|| data.microformat?.playerMicroformatRenderer?.ownerChannelName
+			|| '';
+	}
 
-		const fromMicroformat = data?.microformat?.playerMicroformatRenderer?.ownerChannelName;
-		return fromMicroformat || '';
+	/** Returns ytInitialPlayerResponse only if its video ID matches the current URL (stale after SPA navigation). */
+	private getValidatedPlayerResponse(): any | null {
+		const videoId = this.getVideoId();
+		if (!videoId) return null;
+		const data = this.parseInlineJson('ytInitialPlayerResponse');
+		if (!data) return null;
+		const detailVideoId = data.videoDetails?.videoId;
+		const microformatVideoId = data.microformat?.playerMicroformatRenderer?.externalVideoId;
+		return (detailVideoId === videoId || microformatVideoId === videoId) ? data : null;
 	}
 
 	private parseInlineJson(globalName: string): any | null {
@@ -428,7 +514,7 @@ export class YoutubeExtractor extends BaseExtractor {
 			if (this.options.language) {
 				captionHeaders['Accept-Language'] = this.options.language;
 			}
-			const response = await fetch(track.baseUrl, { headers: captionHeaders });
+			const response = await fetch(track.baseUrl, { headers: captionHeaders, signal: AbortSignal.timeout(4000) });
 			if (!response.ok) return undefined;
 
 			let xml: string;
@@ -560,6 +646,8 @@ export class YoutubeExtractor extends BaseExtractor {
 	}
 
 	private async fetchPlayerData(videoId: string): Promise<any> {
+		// Try Android client first (most reliable for caption tracks)
+		let androidTimedOut = false;
 		try {
 			const headers: Record<string, string> = {
 				'Content-Type': 'application/json',
@@ -571,8 +659,41 @@ export class YoutubeExtractor extends BaseExtractor {
 			const resp = await fetch(INNERTUBE_API_URL, {
 				method: 'POST',
 				headers,
+				signal: AbortSignal.timeout(4000),
 				body: JSON.stringify({
 					context: INNERTUBE_CONTEXT,
+					videoId,
+				})
+			});
+			if (resp.ok) {
+				const data = await resp.json();
+				if (this.getCaptionTracks(data).length > 0) {
+					return data;
+				}
+			}
+		} catch (e: any) {
+			// If the Android request timed out, YouTube is likely throttling this IP.
+			// Skip the WEB fallback to avoid doubling the wait time.
+			if (e?.name === 'TimeoutError') {
+				androidTimedOut = true;
+			}
+		}
+
+		// Try WEB client as fallback — rate-limited independently from Android client
+		if (androidTimedOut) return undefined;
+		try {
+			const webHeaders: Record<string, string> = {
+				'Content-Type': 'application/json',
+			};
+			if (this.options.language) {
+				webHeaders['Accept-Language'] = this.options.language;
+			}
+			const resp = await fetch(INNERTUBE_API_URL, {
+				method: 'POST',
+				headers: webHeaders,
+				signal: AbortSignal.timeout(4000),
+				body: JSON.stringify({
+					context: INNERTUBE_WEB_CONTEXT,
 					videoId,
 				})
 			});
@@ -606,6 +727,7 @@ export class YoutubeExtractor extends BaseExtractor {
 			const resp = await fetch(INNERTUBE_NEXT_URL, {
 				method: 'POST',
 				headers: chapterHeaders,
+				signal: AbortSignal.timeout(4000),
 				body: JSON.stringify({
 					context: INNERTUBE_WEB_CONTEXT,
 					videoId,
@@ -749,12 +871,17 @@ export class YoutubeExtractor extends BaseExtractor {
 			.replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 	}
 
+	private _videoId: string | undefined;
 	private getVideoId(): string {
-		const url = new URL(this.url);
-		if (url.hostname === 'youtu.be') {
-			return url.pathname.slice(1);
+		if (this._videoId === undefined) {
+			const url = new URL(this.url);
+			this._videoId = url.hostname === 'youtu.be'
+				? url.pathname.slice(1)
+				: url.pathname.includes('/shorts/')
+					? url.pathname.split('/shorts/')[1].split('/')[0]
+				: new URLSearchParams(url.search).get('v') || '';
 		}
-		return new URLSearchParams(url.search).get('v') || '';
+		return this._videoId;
 	}
 
 	/**

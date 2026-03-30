@@ -42,9 +42,12 @@ export class MetadataExtractor {
 		}
 
 		const siteName = this.getSiteName(schemaOrgData, metaTags);
-		const { title, detectedSiteName } = this.cleanTitle(this.getRawTitle(doc, schemaOrgData, metaTags), siteName);
+		const { title, detectedSiteName } = this.cleanTitle(this.getBestTitle(doc, schemaOrgData, metaTags, domain, siteName), siteName);
 		const author = this.getAuthor(doc, schemaOrgData, metaTags);
-		const site = siteName || detectedSiteName || author || '';
+		// Only use author as site fallback for short single-entity names (personal blogs);
+		// multi-author strings with commas are not suitable as site identifiers.
+		const authorAsSite = author && !author.includes(',') ? author : '';
+		const site = siteName || detectedSiteName || authorAsSite || domain || '';
 
 		return {
 			title,
@@ -62,6 +65,12 @@ export class MetadataExtractor {
 		};
 	}
 
+	// Returns true if the string looks like an unresolved template literal
+	// e.g. "#author.fullName}" (missing opening brace), "{{author}}", etc.
+	private static isTemplateArtifact(s: string): boolean {
+		return /[{}]/.test(s) || /^#[a-zA-Z]/.test(s);
+	}
+
 	private static getAuthor(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
 		let authorsString: string | undefined;
 
@@ -71,12 +80,12 @@ export class MetadataExtractor {
 			this.getMetaContent(metaTags, "name", "author") ||
 			this.getMetaContent(metaTags, "name", "byl") ||
 			this.getMetaContent(metaTags, "name", "authorList");
-		if (authorsString) return authorsString;
+		if (authorsString && !this.isTemplateArtifact(authorsString)) return authorsString;
 
 		// Conventions for research paper meta tags
-		let authorsStrings: string[] = this.getMetaContents(metaTags, "name", "citation_author");
+		let authorsStrings: string[] = this.getMetaContents(metaTags, "name", "citation_author").filter(s => !this.isTemplateArtifact(s));
 		if (authorsStrings.length === 0) {
-			authorsStrings = this.getMetaContents(metaTags, "property", "dc.creator");
+			authorsStrings = this.getMetaContents(metaTags, "property", "dc.creator").filter(s => !this.isTemplateArtifact(s));
 		}
 		if (authorsStrings.length > 0) {
 			authorsString = authorsStrings.map(s => {
@@ -112,7 +121,7 @@ export class MetadataExtractor {
 		const addDomAuthor = (value: string | null | undefined) => {
 			if (!value) return;
 			value.split(',').forEach(namePart => {
-				const cleanedName = namePart.trim().replace(/,$/, '').trim();
+				const cleanedName = namePart.replace(/\s+/g, ' ').trim().replace(/,$/, '').trim();
 				const lowerCleanedName = cleanedName.toLowerCase();
 				if (cleanedName && lowerCleanedName !== 'author' && lowerCleanedName !== 'authors') {
 					collectedAuthorsFromDOM.push(cleanedName);
@@ -137,6 +146,12 @@ export class MetadataExtractor {
 
 		if (collectedAuthorsFromDOM.length > 0) {
 			let uniqueAuthors = [...new Set(collectedAuthorsFromDOM.map(name => name.trim()).filter(Boolean))];
+			// Remove entries that are superstrings of a shorter entry already present
+			if (uniqueAuthors.length > 1) {
+				uniqueAuthors = uniqueAuthors.filter(a =>
+					!uniqueAuthors.some(b => b !== a && a.includes(b))
+				);
+			}
 			if (uniqueAuthors.length > 0) {
 				if (uniqueAuthors.length > 10) {
 					uniqueAuthors = uniqueAuthors.slice(0, 10);
@@ -152,12 +167,32 @@ export class MetadataExtractor {
 			let sibling = h1.nextElementSibling;
 			for (let i = 0; i < 3 && sibling; i++) {
 				const siblingText = sibling.textContent?.trim() || '';
-				if (this.parseDateText(siblingText)) {
+				// Check both combined text and individual children — some DOMs (e.g. linkedom)
+				// omit whitespace between elements, which breaks word-boundary matching
+				const childEls = Array.from(sibling.querySelectorAll('p, time'));
+				const hasDateChild = childEls.some(el => !!this.parseDateText(el.textContent?.trim() || ''));
+				const hasSiblingDate = !!this.parseDateText(siblingText) || hasDateChild;
+				if (hasSiblingDate) {
 					const links = sibling.querySelectorAll('a');
-					for (const link of links) {
-						const linkText = (link.textContent?.trim() || '').replace(/\u00a0/g, ' ');
+					// Only treat the link as an author if there is exactly one —
+					// multiple links indicate category/tag lists, not a byline.
+					if (links.length === 1) {
+						const linkText = (links[0].textContent?.trim() || '').replace(/\u00a0/g, ' ');
 						if (linkText.length > 0 && linkText.length < 100 && !this.parseDateText(linkText)) {
 							return linkText;
+						}
+					}
+					// Check for plain-text author in a non-date <p> child.
+					// Guard: the date must be in a <p>/<time> child (not just anywhere in the
+					// combined text), and the sibling must be a short metadata-only block
+					// (< 300 chars) to avoid treating article sections as author bylines.
+					if (hasDateChild && siblingText.length < 300) {
+						for (const p of childEls) {
+							if (p.tagName !== 'P') continue;
+							const pText = (p.textContent?.trim() || '').replace(/\u00a0/g, ' ');
+							if (pText.length > 0 && pText.length < 150 && !this.parseDateText(pText)) {
+								return pText;
+							}
 						}
 					}
 				}
@@ -227,16 +262,46 @@ export class MetadataExtractor {
 		return candidate;
 	}
 
-	private static getRawTitle(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
-		return (
-			this.getMetaContent(metaTags, "property", "og:title") ||
-			this.getMetaContent(metaTags, "name", "twitter:title") ||
-			this.getSchemaProperty(schemaOrgData, 'headline') ||
-			this.getMetaContent(metaTags, "name", "title") ||
-			this.getMetaContent(metaTags, "name", "sailthru.title") ||
-			doc.querySelector('title')?.textContent?.trim() ||
-			''
-		);
+	private static getBestTitle(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[], domain: string, siteName: string): string {
+		const candidates = [
+			this.getMetaContent(metaTags, "property", "og:title"),
+			this.getMetaContent(metaTags, "name", "twitter:title"),
+			this.getSchemaProperty(schemaOrgData, 'headline'),
+			this.getMetaContent(metaTags, "name", "title"),
+			this.getMetaContent(metaTags, "name", "sailthru.title"),
+			doc.querySelector('title')?.textContent?.trim() || '',
+		].filter(Boolean);
+
+		if (candidates.length === 0) return '';
+
+		const authorMeta = this.getMetaContent(metaTags, "property", "author") ||
+			this.getMetaContent(metaTags, "name", "author");
+
+		// Pre-normalize identifiers once rather than per candidate
+		const authorNorm = authorMeta.trim().toLowerCase();
+		const siteNorm = siteName.trim().toLowerCase();
+		const domainNorm = domain
+			? domain.replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9]/g, '')
+			: '';
+
+		// Return the first candidate that isn't a site identifier (brand/domain name).
+		// Falls back to the first candidate if all are identifiers.
+		return candidates.find(c => !this.isSiteIdentifier(c, authorNorm, siteNorm, domainNorm))
+			?? candidates[0];
+	}
+
+	private static isSiteIdentifier(candidate: string, authorNorm: string, siteNorm: string, domainNorm: string): boolean {
+		const norm = candidate.trim().toLowerCase();
+
+		if (authorNorm && norm === authorNorm) return true;
+		if (siteNorm && norm === siteNorm) return true;
+
+		if (domainNorm) {
+			const candidateNorm = norm.replace(/[^a-z0-9]/g, '');
+			if (candidateNorm === domainNorm) return true;
+		}
+
+		return false;
 	}
 
 	private static cleanTitle(title: string, siteName: string): { title: string; detectedSiteName: string } {
@@ -437,6 +502,12 @@ export class MetadataExtractor {
 		if (h1) {
 			let sibling = h1.nextElementSibling;
 			for (let i = 0; i < 3 && sibling; i++) {
+				// Check individual children first — some DOMs (e.g. linkedom) omit whitespace
+				// between elements, which breaks word-boundary matching on combined text
+				for (const child of Array.from(sibling.querySelectorAll('p, time'))) {
+					const parsed = this.parseDateText(child.textContent?.trim() || '');
+					if (parsed) return parsed;
+				}
 				const parsed = this.parseDateText(sibling.textContent?.trim() || '');
 				if (parsed) return parsed;
 				sibling = sibling.nextElementSibling;
