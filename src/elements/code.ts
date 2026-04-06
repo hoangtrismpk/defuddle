@@ -137,6 +137,9 @@ export const codeBlockRules = [
 			'.wp-block-code',
 			'div[class*="language-"]',
 
+			// JetBrains Writerside documentation code blocks
+			'.code-block[data-lang]',
+
 			// Verso/Lean docs style highlighted code blocks
 			'code.hl.block'
 		].join(', '),
@@ -284,6 +287,12 @@ export const codeBlockRules = [
 						return '';
 					}
 
+					// Skip UI chrome injected into <code> elements (e.g. rehype-pretty-copy
+					// buttons, injected <style> tags).
+					if (element.tagName === 'BUTTON' || element.tagName === 'STYLE') {
+						return '';
+					}
+
 					// Handle explicit line breaks.
 					// Skip <br> that immediately follows a line-based span (e.g. Hexo/Highlight.js
 					// `<span class="line">CODE</span><br>`) — the line span already appended '\n'.
@@ -298,6 +307,12 @@ export const codeBlockRules = [
 					// Hugo/Chroma line-number spans (<span class="lnt">1\n</span>) live in a
 					// separate table column from the code; skip them entirely.
 					if (element.matches('span.lnt')) {
+						return '';
+					}
+
+					// Pygments inline line number spans (<span class="lineno">1</span>)
+					// are interspersed directly in the code content; skip them.
+					if (element.matches('span.lineno')) {
 						return '';
 					}
 

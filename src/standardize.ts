@@ -11,8 +11,9 @@ import {
 
 import { DefuddleMetadata } from './types';
 import { mathRules } from './elements/math';
+import { wrapRawLatexDelimiters } from './elements/math.base';
 import { codeBlockRules } from './elements/code';
-import { headingRules, removeHeadingAnchors } from './elements/headings';
+import { headingRules, removePermalinkAnchors } from './elements/headings';
 import { imageRules } from './elements/images';
 import { isElement, isTextNode, isCommentNode, getComputedStyle, logDebug } from './utils';
 import { transferContent, isDirectTableChild, getClassName } from './utils/dom';
@@ -166,6 +167,7 @@ export function standardizeContent(element: Element, metadata: DefuddleMetadata,
 
 	if (!debug) {
 		step('flattenWrapperElements[1]', () => flattenWrapperElements(element, doc));
+		step('removePermalinkAnchors', () => removePermalinkAnchors(element));
 		step('stripUnwantedAttributes', () => stripUnwantedAttributes(element, debug));
 		step('unwrapBareSpans', () => unwrapBareSpans(element));
 
@@ -174,6 +176,25 @@ export function standardizeContent(element: Element, metadata: DefuddleMetadata,
 			Array.from(element.querySelectorAll('code a')).forEach(unwrapElement);
 			// Unwrap javascript: links — keep text, remove the link
 			Array.from(element.querySelectorAll('a[href^="javascript:"]')).forEach(unwrapElement);
+			// Restructure links that wrap block content containing a heading (e.g. article cards).
+			// <a href="/x"><h2>Title</h2><p>desc</p></a>
+			// → <h2><a href="/x">Title</a></h2><p>desc</p>
+			// This produces valid HTML that any markdown converter handles correctly.
+			Array.from(element.querySelectorAll('a')).forEach(link => {
+				const href = link.getAttribute('href');
+				if (!href || href.startsWith('#')) return;
+				const heading = Array.from(link.children).find(
+					c => /^H[1-6]$/.test(c.nodeName)
+				) as Element | undefined;
+				if (!heading) return;
+				// Move the href into the heading by wrapping its children in a new <a>
+				const innerLink = doc.createElement('a');
+				innerLink.setAttribute('href', href);
+				while (heading.firstChild) innerLink.appendChild(heading.firstChild);
+				heading.appendChild(innerLink);
+				// Unwrap the outer <a>, leaving the heading and siblings in place
+				unwrapElement(link);
+			});
 			// Unwrap anchor links that wrap headings (e.g. clickable section headers)
 			Array.from(element.querySelectorAll('a[href^="#"]')).forEach(link => {
 				if (link.querySelector('h1, h2, h3, h4, h5, h6')) {
@@ -182,7 +203,6 @@ export function standardizeContent(element: Element, metadata: DefuddleMetadata,
 			});
 		});
 
-		step('removeHeadingAnchors', () => removeHeadingAnchors(element));
 		step('removeObsoleteElements', () => element.querySelectorAll('object, embed, applet').forEach(el => el.remove()));
 		step('removeEmptyElements', () => removeEmptyElements(element));
 		step('removeTrailingHeadings', () => removeTrailingHeadings(element));
@@ -762,6 +782,11 @@ function standardizeElements(element: Element, doc: Document, subProfile?: Recor
 			return r;
 		}
 		: <T>(_: string, fn: () => T): T => fn();
+
+	// Wrap raw $...$ and $$...$$ LaTeX delimiters in <math> elements so the
+	// math rules below can process them. Only fires when MathJax/KaTeX scripts
+	// are present but haven't rendered (no JS execution).
+	stepSE('wrapRawLatexDelimiters', () => wrapRawLatexDelimiters(element, doc));
 
 	// Convert elements based on standardization rules
 	ELEMENT_STANDARDIZATION_RULES.forEach(rule => {

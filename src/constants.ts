@@ -218,7 +218,7 @@ export const EXACT_SELECTORS = [
 
 	// iframes
 	'instaread-player',
-	'iframe:not([src*="youtube"]):not([src*="youtu.be"]):not([src*="vimeo"]):not([src*="twitter"]):not([src*="x.com"]):not([src*="datawrapper"])',
+	'iframe:not([src])',
 
 	// logos
 	'[class="logo" i]',
@@ -250,6 +250,7 @@ export const EXACT_SELECTORS = [
 	'#sidebar',
 	'#Sidebar',
 	'#side-bar',
+	'#secondary',
 	'#sitesub',
 
 	// skip links
@@ -343,6 +344,7 @@ export const PARTIAL_SELECTORS = [
 	'article-snippet',
 	'article-separator',
 	'article--share',
+	'article-share',
 	'article--topics',
 	'articletags',
 	'article-tags',
@@ -462,6 +464,7 @@ export const PARTIAL_SELECTORS = [
 	'editorial_contact',
 	'editorial-contact',
 	'element-invisible',
+	'elementor-shortcode',
 	'eletters',
 	'emailsignup',
 	'emoji-bar',
@@ -607,6 +610,8 @@ export const PARTIAL_SELECTORS = [
 //	'navigation',
 	'navigation-post',
 	'next-',
+	'next_prev',
+	'no-script',
 	'newsgallery',
 	'news-story-title',
 //	'newsletter', used on Substack
@@ -732,7 +737,7 @@ export const PARTIAL_SELECTORS = [
 	'redirectedfrom',
 	'recirc',
 	'register',
-	'related',
+	'(?<!h[1-6]-)related',
 	'relevant',
 	'reversefootnote',
 	'robots-nocontent',
@@ -787,6 +792,7 @@ export const PARTIAL_SELECTORS = [
 	'slug-wrap',
 //	'social',
 	'social-author',
+	'social-button',
 	'social-shar',
 	'social-date',
 	'speechify-ignore',

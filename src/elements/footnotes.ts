@@ -400,19 +400,7 @@ class FootnoteHandler {
 					const id = String(num);
 					if (processedIds.has(id)) continue;
 
-					const contentDiv = element.ownerDocument.createElement('div');
-
-					// Clone and strip the leading number marker
-					const pClone = defPara.cloneNode(true) as any;
-					const marker = pClone.firstElementChild;
-					if (marker) {
-						marker.remove();
-						const firstNode = pClone.firstChild;
-						if (firstNode?.nodeType === 3) {
-							firstNode.textContent = firstNode.textContent.replace(/^\s+/, '');
-						}
-					}
-					contentDiv.appendChild(pClone);
+					const contentDiv = this.stripMarkerAndWrap(defPara);
 
 					// Include sibling elements (e.g. lists) until the next numbered paragraph
 					let sibling: any = defPara.nextElementSibling;
@@ -430,7 +418,47 @@ class FootnoteHandler {
 			}
 		}
 
+		// Class-based footnote paragraphs: <p class="footnote"><sup>N</sup>content...</p>
+		// The "footnote" class is a strong enough signal that we don't require cross-validation
+		// or a minimum count, so even a single footnote is detected.
+		if (footnoteCount === 1) {
+			const footnoteParagraphs: Array<{num: number; el: any}> = [];
+			element.querySelectorAll('p.footnote').forEach((p: any) => {
+				const num = this.parseFootnoteNum(p);
+				if (num !== null) {
+					footnoteParagraphs.push({ num, el: p });
+				}
+			});
+
+			for (const { num, el: defPara } of footnoteParagraphs) {
+				const id = String(num);
+				if (processedIds.has(id)) continue;
+
+				footnotes[footnoteCount] = { content: this.stripMarkerAndWrap(defPara), originalId: id, refs: [] };
+				processedIds.add(id);
+				footnoteCount++;
+			}
+			this.genericElements.push(...footnoteParagraphs.map(p => p.el));
+		}
+
 		return footnotes;
+	}
+
+	// Clones a footnote paragraph, removes the leading number marker (sup/strong),
+	// strips leftover whitespace, and wraps the result in a div.
+	stripMarkerAndWrap(el: any): any {
+		const contentDiv = el.ownerDocument.createElement('div');
+		const clone = el.cloneNode(true) as any;
+		const marker = clone.firstElementChild;
+		if (marker) {
+			marker.remove();
+			const firstNode = clone.firstChild;
+			if (firstNode?.nodeType === 3) {
+				firstNode.textContent = firstNode.textContent.replace(/^\s+/, '');
+			}
+		}
+		contentDiv.appendChild(clone);
+		return contentDiv;
 	}
 
 	// Returns the footnote number if `el` is a <p> whose first child is <sup>N> or <strong>N</strong>,
@@ -584,6 +612,25 @@ class FootnoteHandler {
 			}
 		});
 		return results;
+	}
+
+	replaceContainerPreservingText(container: any, footnoteRef: any): void {
+		let directText = '';
+		let hasChildElements = false;
+		for (const node of container.childNodes) {
+			if (isTextNode(node)) directText += node.textContent || '';
+			else if (isElement(node)) hasChildElements = true;
+		}
+		directText = directText.trim();
+
+		if (directText && hasChildElements) {
+			const fragment = container.ownerDocument.createDocumentFragment();
+			fragment.appendChild(container.ownerDocument.createTextNode(directText));
+			fragment.appendChild(footnoteRef);
+			container.replaceWith(fragment);
+		} else {
+			container.replaceWith(footnoteRef);
+		}
 	}
 
 	findOuterFootnoteContainer(el: any): any {
@@ -867,26 +914,7 @@ class FootnoteHandler {
 						const group = supGroups.get(container);
 						group.push(this.createFootnoteReference(footnoteNumber, refId));
 					} else {
-						// If the container has both direct text nodes and child elements,
-						// the text nodes are meaningful visible content (e.g. a year "1799"
-						// used as anchor text) while child elements hold the hidden footnote mark.
-						// Preserve the visible text alongside the footnote reference.
-						let directText = '';
-						let hasChildElements = false;
-						for (const node of container.childNodes) {
-							if (isTextNode(node)) directText += node.textContent || '';
-							else if (isElement(node)) hasChildElements = true;
-						}
-						directText = directText.trim();
-
-						if (directText && hasChildElements) {
-							const fragment = container.ownerDocument.createDocumentFragment();
-							fragment.appendChild(container.ownerDocument.createTextNode(directText));
-							fragment.appendChild(this.createFootnoteReference(footnoteNumber, refId));
-							container.replaceWith(fragment);
-						} else {
-							container.replaceWith(this.createFootnoteReference(footnoteNumber, refId));
-						}
+						this.replaceContainerPreservingText(container, this.createFootnoteReference(footnoteNumber, refId));
 					}
 				}
 			}
@@ -943,7 +971,7 @@ class FootnoteHandler {
 				footnoteData.refs.push(refId);
 
 				const container = this.findOuterFootnoteContainer(link);
-				container.replaceWith(this.createFootnoteReference(footnoteNumber, refId));
+				this.replaceContainerPreservingText(container, this.createFootnoteReference(footnoteNumber, refId));
 			});
 
 			// Pass 2: Match sup/span elements with numeric text (e.g. <sup class="footnote-ref">1</sup>)
@@ -978,7 +1006,7 @@ class FootnoteHandler {
 					footnoteData.refs.push(refId);
 
 					const container = this.findOuterFootnoteContainer(el);
-					container.replaceWith(this.createFootnoteReference(footnoteNumber, refId));
+					this.replaceContainerPreservingText(container, this.createFootnoteReference(footnoteNumber, refId));
 				});
 			}
 		}

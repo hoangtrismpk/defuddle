@@ -1,5 +1,4 @@
 import { MetadataExtractor } from './metadata';
-import { removeHeadingAnchors } from './elements/headings';
 import { DefuddleOptions, DefuddleResponse, MetaTagItem, DebugRemoval } from './types';
 import { ExtractorRegistry } from './extractor-registry';
 import type { ExtractorOptions } from './extractors/_base';
@@ -41,6 +40,7 @@ export class Defuddle {
 	private _metadata: any | undefined;
 	private _mobileStyles: StyleChange[] | undefined;
 	private _smallImages: Set<string> | undefined;
+	private _inExtractorPipelineRun = false;
 
 	/**
 	 * Create a new Defuddle instance
@@ -69,6 +69,13 @@ export class Defuddle {
 	 * Parse the document and extract its main content
 	 */
 	parse(): DefuddleResponse {
+		// Replace base64 placeholder images with real URLs from <noscript>
+		// fallbacks before content extraction. Must run before parseInternal
+		// so the promoted URLs are available when content is scored/extracted.
+		if (this.doc.body) {
+			this._resolveNoscriptImages(this.doc.body);
+		}
+
 		// Try first with default settings
 		let result = this.parseInternal();
 
@@ -142,22 +149,24 @@ export class Defuddle {
 		}
 
 		// Strip dangerous elements from this.doc before any fallback paths
-		// that read from it (e.g. _findContentBySchemaText).
-		// This must happen after parseInternal, which needs script tags
-		// for schema.org extraction, site-specific extractors, and math.
+		// that read from it. This must happen after parseInternal, which needs
+		// script tags for schema.org extraction, site-specific extractors, and math.
 		this._stripUnsafeElements();
 
-		// If schema.org has a SocialMediaPosting with text content that is
-		// significantly longer than what we extracted, the scorer likely picked
-		// the wrong element from a feed. Use a 1.5x threshold to avoid triggering
-		// when the difference is small (e.g. just related-content link text removed).
+		// If schema.org has text content that is significantly longer than what we
+		// extracted, the scorer likely picked the wrong element from a feed page.
+		// Use a 1.5x threshold to avoid triggering when the difference is small
+		// (e.g. just related-content link text removed).
 		const schemaText = this._getSchemaText(result.schemaOrgData);
 		if (schemaText && this.countHtmlWords(schemaText) > result.wordCount * 1.5) {
-			const contentHtml = this._findContentBySchemaText(schemaText);
-			if (contentHtml) {
-				this._log('Found DOM content matching schema.org text');
-				result.content = contentHtml;
-				result.wordCount = this.countHtmlWords(contentHtml);
+			const bestMatch = this._findElementBySchemaText(this.doc.body, schemaText);
+			if (bestMatch) {
+				// Re-run the full pipeline with the schema-identified element as the
+				// content root so it benefits from the same cleanup as normal extraction.
+				const selector = this.getElementSelector(bestMatch);
+				this._log('Schema.org suggests a better content element, retrying with selector:', selector);
+				const schemaRetry = this.parseInternal({ contentSelector: selector });
+				result = schemaRetry;
 			} else {
 				this._log('Using schema.org text as content (DOM element not found)');
 				result.content = schemaText;
@@ -235,6 +244,50 @@ export class Defuddle {
 	}
 
 	/**
+	 * Replace base64 placeholder images with real URLs from <noscript> fallbacks.
+	 * Next.js (data-nimg) renders a tiny base64 gif as src with the real image
+	 * only inside a <noscript> sibling. This promotes the real URL before
+	 * noscript elements are stripped.
+	 */
+	private _resolveNoscriptImages(body: Element): void {
+		const noscripts = body.querySelectorAll('noscript');
+		for (const noscript of noscripts) {
+			// Try direct child query first (linkedom parses noscript children),
+			// fall back to parsing innerHTML for browser environments
+			let noscriptImg = noscript.querySelector('img');
+			if (!noscriptImg) {
+				const html = noscript.innerHTML || '';
+				if (!html.includes('<img')) continue;
+				const fragment = parseHTML(this.doc, html);
+				noscriptImg = fragment.querySelector('img');
+			}
+			if (!noscriptImg) continue;
+
+			const realSrc = noscriptImg.getAttribute('src') || '';
+			if (!realSrc || realSrc.startsWith('data:')) continue;
+
+			const alt = noscriptImg.getAttribute('alt');
+			const parent = noscript.parentElement;
+			if (!parent) continue;
+
+			const siblingImgs = parent.querySelectorAll(':scope > img');
+			for (const img of siblingImgs) {
+				const src = img.getAttribute('src') || '';
+				if (!src.startsWith('data:')) continue;
+				// Match by alt text; require a non-empty alt to avoid false matches
+				if (!alt || img.getAttribute('alt') !== alt) continue;
+
+				img.setAttribute('src', realSrc);
+				const srcset = noscriptImg.getAttribute('srcset') || '';
+				if (srcset) {
+					img.setAttribute('srcset', srcset);
+				}
+				break;
+			}
+		}
+	}
+
+	/**
 	 * Find the smallest DOM element whose text contains the search phrase
 	 * and whose word count is at least 80% of the expected count.
 	 * Shared by _findSchemaContentElement and _findContentBySchemaText.
@@ -265,63 +318,6 @@ export class Defuddle {
 		return bestMatch;
 	}
 
-	/**
-	 * Find a DOM element whose text matches the schema.org text content.
-	 * Used when the content scorer picked the wrong element from a feed page.
-	 * Returns the element's inner HTML including sibling media (images, etc.)
-	 */
-	private _findContentBySchemaText(schemaText: string): string {
-		const body = this.doc.body;
-		if (!body) return '';
-
-		const bestMatch = this._findElementBySchemaText(body, schemaText);
-		if (!bestMatch) return '';
-
-		// Read the largest sibling image src BEFORE resolveRelativeUrls
-		// can mangle comma-containing CDN URLs in srcset attributes
-		let imageSrc = '';
-		let imageAlt = '';
-		const parent = bestMatch.parentElement;
-		if (parent && parent !== body) {
-			const images = parent.querySelectorAll('img');
-			let largestImg: Element | null = null;
-			let largestArea = 0;
-			for (const img of images) {
-				if (bestMatch.contains(img)) continue;
-				const w = parseInt(img.getAttribute('width') || '0', 10);
-				const h = parseInt(img.getAttribute('height') || '0', 10);
-				const area = w * h;
-				if (area > largestArea) {
-					largestArea = area;
-					largestImg = img;
-				}
-			}
-			if (largestImg) {
-				imageSrc = this._getLargestImageSrc(largestImg);
-				imageAlt = largestImg.getAttribute('alt') || '';
-				try {
-					const baseUrl = this.options.url || this.doc.URL;
-					if (baseUrl) imageSrc = new URL(imageSrc, baseUrl).href;
-				} catch {}
-			}
-		}
-
-		// Remove heading anchor links before serialization (e.g. <h2>Title<a href="#foo">#</a></h2>)
-		removeHeadingAnchors(bestMatch);
-
-		// Now resolve URLs in the text content
-		this.resolveRelativeUrls(bestMatch);
-		let html = serializeHTML(bestMatch);
-
-		if (imageSrc) {
-			const img = this.doc.createElement('img');
-			img.setAttribute('src', imageSrc);
-			img.setAttribute('alt', imageAlt);
-			html += img.outerHTML;
-		}
-
-		return html;
-	}
 
 	private findLargestHiddenContentSelector(): string | undefined {
 		const body = this.doc.body;
@@ -533,10 +529,36 @@ export class Defuddle {
 				includeReplies: options.includeReplies as ExtractorOptions['includeReplies'],
 				language: options.language,
 			};
-			const extractor = ExtractorRegistry.findExtractor(this.doc, url, schemaOrgData, extractorOpts);
-			if (extractor && extractor.canExtract()) {
-				const extracted = extractor.extract();
-				return this.buildExtractorResponse(extracted, metadata, startTime, extractor, pageMetaTags);
+			if (!this._inExtractorPipelineRun) {
+				const extractor = ExtractorRegistry.findExtractor(this.doc, url, schemaOrgData, extractorOpts);
+				if (extractor && extractor.canExtract()) {
+					const extracted = extractor.extract();
+					if (extracted.contentSelector) {
+						this._inExtractorPipelineRun = true;
+						try {
+							const pipelineResult = this.parseInternal({
+								contentSelector: extracted.contentSelector,
+								removeLowScoring: false,
+								removeHiddenElements: false,
+							});
+							const variables = this.getExtractorVariables(extracted.variables);
+							return {
+								...pipelineResult,
+								title: extracted.variables?.title || pipelineResult.title,
+								description: extracted.variables?.description || pipelineResult.description,
+								author: extracted.variables?.author || pipelineResult.author,
+								published: extracted.variables?.published || pipelineResult.published,
+								site: extracted.variables?.site || pipelineResult.site,
+								language: extracted.variables?.language || pipelineResult.language,
+								extractorType: extractor.constructor.name.replace('Extractor', '').toLowerCase(),
+								...(variables ? { variables } : {}),
+							};
+						} finally {
+							this._inExtractorPipelineRun = false;
+						}
+					}
+					return this.buildExtractorResponse(extracted, metadata, startTime, extractor, pageMetaTags);
+				}
 			}
 
 			// Continue if there is no extractor...
@@ -931,11 +953,17 @@ export class Defuddle {
 		const hasTableLayout = tables.some(table => {
 			const width = parseInt(table.getAttribute('width') || '0');
 			const style = this.getComputedStyle(table);
+			const tableClass = getClassName(table).toLowerCase();
 			return width > 400 ||
 				(style?.width?.includes('px') && parseInt(style.width) > 400) ||
 				table.getAttribute('align') === 'center' ||
-				(table.className || '').toLowerCase().includes('content') ||
-				(table.className || '').toLowerCase().includes('article');
+				tableClass.includes('content') ||
+				tableClass.includes('article') ||
+				// Multi-column layout: a row with 2+ cells where at least one has an explicit width
+				Array.from(table.getElementsByTagName('tr')).some(row => {
+					const cells = Array.from(row.children).filter(c => c.tagName === 'TD');
+					return cells.length >= 2 && cells.some(c => c.getAttribute('width'));
+				});
 		});
 
 		if (!hasTableLayout) {

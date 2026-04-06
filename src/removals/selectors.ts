@@ -50,8 +50,11 @@ export function removeBySelector(doc: Document, debug: boolean, removeExact: boo
 			? PARTIAL_SELECTORS.map(p => ({ pattern: p, regex: new RegExp(p, 'i') }))
 			: null;
 
-		// Use pre-built attribute selector for elements we care about
-		const allElements = doc.querySelectorAll(TEST_ATTRIBUTES_SELECTOR);
+		// Query both doc and mainContent because linkedom's document-level
+		// querySelectorAll can miss elements after prior DOM mutations.
+		const docElements = doc.querySelectorAll(TEST_ATTRIBUTES_SELECTOR);
+		const mainElements = mainContent ? mainContent.querySelectorAll(TEST_ATTRIBUTES_SELECTOR) : [];
+		const allElements = new Set<Element>([...docElements, ...mainElements]);
 
 		// Process elements for partial matches
 		allElements.forEach(el => {
@@ -69,9 +72,13 @@ export function removeBySelector(doc: Document, debug: boolean, removeExact: boo
 
 			// Get all relevant attributes and combine into a single string
 			// (Hardcoded to match TEST_ATTRIBUTES in constants.ts — avoids array allocation per element)
+			// For heading elements, exclude the id attribute — heading IDs are
+			// auto-generated slugs from content text (e.g. "3-ignore-the-error")
+			// that would falsely match partial selectors like "-error".
+			const isHeading = /^H[1-6]$/.test(tag);
 			const attrs = (
 				getClassName(el) + ' ' +
-				(el.id || '') + ' ' +
+				(isHeading ? '' : (el.id || '')) + ' ' +
 				(el.getAttribute('data-component') || '') + ' ' +
 				(el.getAttribute('data-test') || '') + ' ' +
 				(el.getAttribute('data-testid') || '') + ' ' +

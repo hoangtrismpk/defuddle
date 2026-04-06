@@ -2,7 +2,7 @@ import { CONTENT_ELEMENT_SELECTOR } from '../constants';
 import { DebugRemoval } from '../types';
 import { textPreview, countWords } from '../utils';
 
-const CONTENT_DATE_PATTERN = /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i;
+const CONTENT_DATE_PATTERN = /(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}|\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)/i;
 const CONTENT_READ_TIME_PATTERN = /\d+\s*min(?:ute)?s?\s+read\b/i;
 const BYLINE_UPPERCASE_PATTERN = /^\p{Lu}/u;
 const STARTS_WITH_BY_PATTERN = /^by\s+\S/i;
@@ -335,6 +335,23 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 				}
 			}
 		}
+
+		// Remove standalone date elements near the start of content.
+		if (hasDate && words <= 5 && getPos() <= 300) {
+			let residual = text;
+			for (const pattern of METADATA_STRIP_BASE) {
+				residual = residual.replace(pattern, '');
+			}
+			residual = residual.replace(/[,\s]+/g, '').trim();
+			if (residual.length === 0) {
+				const target = walkUpToWrapper(el, text, mainContent);
+				if (debug && debugRemovals) {
+					debugRemovals.push({ step: 'removeByContentPattern', reason: 'standalone date metadata', text: textPreview(target) });
+				}
+				target.remove();
+				continue;
+			}
+		}
 	}
 
 	// Remove standalone time/date elements near the start or end of content.
@@ -471,7 +488,10 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 			// Exception: allow embedded <a> elements that appear before the first heading —
 			// these are back-navigation links in page headers, not inline prose links.
 			if (el.matches('a[href]') && el.parentElement && el.parentElement !== mainContent) {
-				if ((el.parentElement.textContent?.trim() || '') !== text) {
+				const parentText = el.parentElement.textContent?.trim() || '';
+				if (parentText !== text) {
+					// Skip links inside paragraphs — these are inline prose links, not breadcrumbs
+					if (el.closest('p')) continue;
 					if (!firstHeading) continue;
 					if (!(el.compareDocumentPosition(firstHeading) & 4)) continue;
 				}
@@ -631,7 +651,8 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 			child = child.previousElementSibling;
 		}
 		// Must have a heading in the trailing elements and total < 15% of content.
-		// Skip if trailing elements contain content indicators (math, code, tables, images).
+		// Skip if trailing elements contain content indicators (math, code, tables, images)
+		// or multiple prose paragraphs (which indicate a real content section like a conclusion).
 		if (trailingEls.length >= 1 && trailingWords < totalWords * 0.15) {
 			const hasHeading = trailingEls.some(el =>
 				/^H[1-6]$/.test(el.tagName) || el.querySelector('h1, h2, h3, h4, h5, h6')
@@ -639,7 +660,14 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 			const hasContent = trailingEls.some(el =>
 				el.querySelector(CONTENT_ELEMENT_SELECTOR)
 			);
-			if (hasHeading && !hasContent) {
+			// Multiple prose paragraphs indicate a conclusion, not a CTA/promo block.
+			let proseParagraphs = 0;
+			for (const el of trailingEls) {
+				if (el.tagName === 'P' && countWords(el.textContent || '') > 5) {
+					proseParagraphs++;
+				}
+			}
+			if (hasHeading && !hasContent && proseParagraphs < 2) {
 				for (const el of trailingEls) {
 					if (debug && debugRemovals) {
 						debugRemovals.push({ step: 'removeByContentPattern', reason: 'trailing thin section', text: textPreview(el) });
@@ -657,6 +685,7 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 	const boilerplateElements = mainContent.querySelectorAll('p, div, span, section');
 	for (const el of boilerplateElements) {
 		if (!el.parentNode) continue;
+		if (el.closest('pre, code')) continue;
 		const text = el.textContent?.trim() || '';
 		const words = countWords(text);
 		if (words > 50 || words < 1) continue;
@@ -746,9 +775,10 @@ export function removeByContentPattern(mainContent: Element, debug: boolean, url
 		if (el.children.length < 2) continue;
 		const children = Array.from(el.children);
 
-		// Each qualifying card must contain both an image and a heading
+		// Each qualifying card must contain an image and either a heading or a link
+		// (headings may have been stripped by earlier selector removal steps)
 		const cardCount = children.filter(c =>
-			c.querySelector('img, picture') && c.querySelector('h2, h3, h4')
+			c.querySelector('img, picture') && (c.querySelector('h2, h3, h4') || c.querySelector('a[href]'))
 		).length;
 		if (cardCount < 2 || cardCount < children.length * 0.7) continue;
 
