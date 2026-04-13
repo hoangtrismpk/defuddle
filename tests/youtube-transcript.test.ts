@@ -155,6 +155,97 @@ describe('YouTube transcript parsing', () => {
 		expect(lines[5]).toBe('**0:12** · That\'s interesting.');
 	});
 
+	test('groups segments by dash speaker markers', () => {
+		const extractor = createExtractor();
+		const xml = `<timedtext><body>
+<p t="0" d="3000"><s>- Some things are not normal.</s></p>
+<p t="3000" d="7000"><s>By that I mean if you go out in the world.</s></p>
+<p t="10000" d="6000"><s>You will find that most data clusters around some average.</s></p>
+<p t="24000" d="3000"><s>- Nature shows power laws all over the place.</s></p>
+<p t="27000" d="3000"><s>That seems weird.</s></p>
+</body></timedtext>`;
+
+		const result = (extractor as any).parseTranscriptXml(xml, 'en');
+		const lines = result.text.split('\n');
+
+		// First speaker — dash stripped, first short sentence stays separate
+		expect(lines[0]).toBe('**0:00** · Some things are not normal.');
+		expect(lines[1]).toBe('**0:03** · By that I mean if you go out in the world. You will find that most data clusters around some average.');
+		// Blank line before second speaker
+		expect(lines[2]).toBe('');
+		// Second speaker — dash stripped
+		expect(lines[3]).toContain('Nature shows power laws all over the place.');
+		expect(lines[3]).not.toContain('- ');
+	});
+
+	test('breaks at mid-text sentence boundaries in unpunctuated ASR', () => {
+		const extractor = createExtractor();
+		// Simulate ASR segments where punctuation falls mid-segment.
+		// Each segment is ~2s, so 30s cap triggers around segment 15.
+		const xml = `<timedtext><body>
+<p t="0" d="2000"><s>Oh yeah. Yeah. I started</s></p>
+<p t="2000" d="2000"><s>using Twitter because I was bored. So</s></p>
+<p t="4000" d="2000"><s>my wife and I were traveling around</s></p>
+<p t="6000" d="2000"><s>in Europe for December. We were just</s></p>
+<p t="8000" d="2000"><s>kind of nomading around. We went to</s></p>
+<p t="10000" d="2000"><s>like Copenhagen went to a few different</s></p>
+<p t="12000" d="2000"><s>countries. Um and for me it was just</s></p>
+<p t="14000" d="2000"><s>like a coding vacation. So every day I</s></p>
+<p t="16000" d="2000"><s>was coding and that is like my favorite</s></p>
+<p t="18000" d="2000"><s>kind of vacation just to just like code</s></p>
+<p t="20000" d="2000"><s>all day. It is the best. And at some</s></p>
+<p t="22000" d="2000"><s>point I just kind of got bored and like</s></p>
+<p t="24000" d="2000"><s>I ran out of ideas for you know like a</s></p>
+<p t="26000" d="2000"><s>few hours. I was like okay what do I</s></p>
+<p t="28000" d="2000"><s>want to do next? And so I opened</s></p>
+<p t="30000" d="2000"><s>Twitter. I saw some people tweeting</s></p>
+<p t="32000" d="2000"><s>about it and then I just started</s></p>
+</body></timedtext>`;
+
+		const result = (extractor as any).parseTranscriptXml(xml, 'en');
+		const lines = result.text.split('\n');
+
+		// Should break at a sentence boundary, not at the 30s mark mid-sentence
+		const firstGroup = lines[0];
+		// First group should end at a sentence boundary (period or question mark)
+		expect(firstGroup).toMatch(/[.!?]$/);
+		// Should not end mid-sentence like "And so I opened" or "I just kind of"
+		expect(firstGroup).not.toMatch(/\b(of|and|I|the|a|to)\s*$/i);
+	});
+
+	test('breaks at CJK sentence punctuation', () => {
+		const extractor = createExtractor();
+		const xml = `<timedtext><body>
+<p t="0" d="2000"><s>这是第一句话关于人工智能。</s></p>
+<p t="2000" d="2000"><s>这是第二句关于机器学习。</s></p>
+</body></timedtext>`;
+
+		const result = (extractor as any).parseTranscriptXml(xml, 'zh');
+		const lines = result.text.split('\n');
+
+		// Should split at 。 (ideographic period) at end of each segment
+		expect(lines[0]).toBe('**0:00** · 这是第一句话关于人工智能。');
+		expect(lines[1]).toBe('**0:02** · 这是第二句关于机器学习。');
+	});
+
+	test('breaks at mid-text CJK sentence boundary in long segments', () => {
+		const extractor = createExtractor();
+		// Build segments spanning >30s where CJK punctuation falls mid-segment
+		const segs = [];
+		for (let i = 0; i < 17; i++) {
+			const t = i * 2000;
+			const text = i === 12 ? '这很重要。接下来我们' : '继续讨论这个话题';
+			segs.push(`<p t="${t}" d="2000"><s>${text}</s></p>`);
+		}
+		const xml = `<timedtext><body>${segs.join('\n')}</body></timedtext>`;
+
+		const result = (extractor as any).parseTranscriptXml(xml, 'zh');
+		const lines = result.text.split('\n');
+
+		// First group should end at the 。 boundary, not at an arbitrary 30s cut
+		expect(lines[0]).toMatch(/。$/);
+	});
+
 	test('groups segments by sentences when no speaker markers', () => {
 		const extractor = createExtractor();
 		const xml = `<timedtext><body>
@@ -330,6 +421,44 @@ describe('YouTube transcript parsing', () => {
 		}
 	});
 
+	test('fetchPlayerData falls back to inline data when API times out', async () => {
+		const extractor = createExtractor(`
+			<html>
+				<body>
+						<script>
+							var ytInitialPlayerResponse = {
+								"videoDetails": { "videoId": "test123" },
+								"captions": {
+								"playerCaptionsTracklistRenderer": {
+									"captionTracks": [
+										{
+											"languageCode": "en",
+											"baseUrl": "https://www.youtube.com/api/timedtext?v=test123&lang=en"
+										}
+									]
+								}
+							}
+						};
+					</script>
+				</body>
+			</html>
+		`);
+
+		const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+		const fetchMock = vi.fn().mockRejectedValue(timeoutError);
+		vi.stubGlobal('fetch', fetchMock);
+		try {
+			const playerData = await (extractor as any).fetchPlayerData('test123');
+			const tracks = (extractor as any).getCaptionTracks(playerData);
+
+			// Should fall back to inline data when API times out
+			expect(tracks).toHaveLength(1);
+			expect(tracks[0].baseUrl).toContain('v=test123');
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	test('extractAsync uses an existing transcript panel before opening it', async () => {
 		const extractor = createExtractor(`
 			<html>
@@ -400,7 +529,7 @@ describe('YouTube transcript parsing', () => {
 					${getTranscriptPanelHtml()}
 				</body>
 			</html>
-		`, 'https://www.youtube.com/watch?v=test123', { language: 'zh' });
+		`, 'https://www.youtube.com/watch?v=test123', { language: 'zh'});
 
 		const document = (extractor as any).document as Document;
 		const openButton = document.querySelector('#open-transcript') as HTMLButtonElement;
@@ -448,7 +577,7 @@ describe('YouTube transcript parsing', () => {
 					${getTranscriptPanelHtmlWithoutLanguageButton()}
 				</body>
 			</html>
-		`, 'https://www.youtube.com/watch?v=test123', { language: 'zh' });
+		`, 'https://www.youtube.com/watch?v=test123', { language: 'zh'});
 
 		(extractor as any).fetchTranscript = vi.fn().mockResolvedValue({
 			html: '<div class="youtube transcript"><h2>Transcript</h2><p class="transcript-segment"><strong><span class="timestamp" data-timestamp="0">0:00</span></strong> · 你好，世界。</p></div>',
@@ -485,6 +614,46 @@ describe('YouTube transcript parsing', () => {
 		expect(track?.languageCode).toBe('zh');
 	});
 
+	test('pickCaptionTrack prefers non-ASR tracks over auto-generated ones', () => {
+		const extractor = createExtractor();
+		const track = (extractor as any).pickCaptionTrack([
+			{ languageCode: 'en', kind: 'asr' },
+			{ languageCode: 'en' },
+		]);
+
+		expect(track?.kind).toBeUndefined();
+		expect(track?.languageCode).toBe('en');
+	});
+
+	test('pickCaptionTrack falls back to ASR when no manual tracks exist', () => {
+		const extractor = createExtractor();
+		const track = (extractor as any).pickCaptionTrack([
+			{ languageCode: 'en', kind: 'asr' },
+		]);
+
+		expect(track?.kind).toBe('asr');
+	});
+
+	test('collapses newlines within caption segments to spaces', () => {
+		const extractor = createExtractor();
+		const xml = `<?xml version="1.0" encoding="utf-8"?>
+<timedtext format="3">
+<body>
+<p t="0" d="2690">- The first time I tried to use Obsidian,</p>
+<p t="6180" d="2960">I couldn&#39;t quite get
+it to do what I wanted.</p>
+<p t="9140" d="3010">And frankly, I just didn&#39;t
+get all of the hype.</p>
+</body>
+</timedtext>`;
+
+		const result = (extractor as any).parseTranscriptXml(xml, 'en');
+		expect(result).toBeDefined();
+		expect(result.text).toContain("I couldn't quite get it to do what I wanted.");
+		expect(result.text).toContain("And frankly, I just didn't get all of the hype.");
+		expect(result.text).not.toContain('\n\n');
+	});
+
 	test('extractAsync does not open the transcript panel when API transcript succeeds', async () => {
 		const extractor = createExtractor(`
 			<html>
@@ -494,7 +663,7 @@ describe('YouTube transcript parsing', () => {
 					</ytd-video-description-transcript-section-renderer>
 				</body>
 			</html>
-		`);
+		`, 'https://www.youtube.com/watch?v=test123', { useDomTranscript: false });
 
 		const document = (extractor as any).document as Document;
 		const openButton = document.querySelector('#open-transcript') as HTMLButtonElement;

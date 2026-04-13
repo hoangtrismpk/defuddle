@@ -1,16 +1,30 @@
 import { BaseExtractor, ExtractorOptions } from './_base';
 import { ExtractorResult } from '../types/extractors';
 import { escapeHtml } from '../utils/dom';
-import { countWords } from '../utils';
+import { countWords, CJK_CHAR_RANGES } from '../utils';
 import { buildTranscript } from '../utils/transcript';
 
-const SENTENCE_END = /[.!?]["'\u2019\u201D)]*\s*$/;
-const QUESTION_END = /\?["'\u2019\u201D)]*\s*$/;
+const CJK_SENTENCE_PUNCT = '\u3002\uFF01\uFF1F';  // 。！？
+const CJK_CLOSE_QUOTES = '\u300D\u300F\uFF09';    // 」』）
+const SENTENCE_END = new RegExp(`[.!?${CJK_SENTENCE_PUNCT}]["'\\u2019\\u201D)${CJK_CLOSE_QUOTES}]*\\s*$`);
+const QUESTION_END = new RegExp(`[?\\uFF1F]["'\\u2019\\u201D)${CJK_CLOSE_QUOTES}]*\\s*$`);
+const SPEAKER_MARKER = /^(>>|-\s)/;
+const SPEAKER_STRIP = /^(>>\s*|-\s+)/;
+const TRAILING_COMMA = /,\s*$/;
 const TRANSCRIPT_GROUP_GAP_SECONDS = 20;
+const TRANSCRIPT_MAX_GROUP_SECONDS = 30;
+// Latin: sentence punct + optional quotes + whitespace + uppercase letter
+// CJK: fullwidth sentence punct + optional close quotes + any CJK character (no space needed)
+const MID_TEXT_SENTENCE_BOUNDARY = new RegExp(
+	`^(.*[.!?]["'\\u2019\\u201D)]*)\\s+([A-Z].*)$` +
+	`|^(.*[${CJK_SENTENCE_PUNCT}][${CJK_CLOSE_QUOTES}]*)([${CJK_CHAR_RANGES}].*)$`
+);
 const TURN_MERGE_MAX_WORDS = 80;
 const TURN_MERGE_MAX_SPAN_SECONDS = 45;
 const SHORT_UTTERANCE_MAX_WORDS = 3;
 const FIRST_GROUP_MERGE_MIN_WORDS = 8;
+
+const FETCH_TIMEOUT_MS = 4000;
 
 // Unofficial InnerTube API. Uses Android client context to get caption track URLs.
 // Version may need updating if Google changes the API.
@@ -24,6 +38,12 @@ const INNERTUBE_CONTEXT = {
 };
 const INNERTUBE_USER_AGENT = `com.google.android.youtube/${INNERTUBE_CLIENT_VERSION} (Linux; U; Android 14)`;
 const INNERTUBE_NEXT_URL = 'https://www.youtube.com/youtubei/v1/next?prettyPrint=false';
+const INNERTUBE_IOS_CONTEXT = {
+	client: {
+		clientName: 'IOS',
+		clientVersion: '20.10.3',
+	}
+};
 const INNERTUBE_WEB_CONTEXT = {
 	client: {
 		clientName: 'WEB',
@@ -82,11 +102,14 @@ export class YoutubeExtractor extends BaseExtractor {
 
 	async extractAsync(): Promise<ExtractorResult> {
 		const existingTranscript = this.extractTranscriptFromExistingDom();
-		const transcript = this.shouldUseExistingDomTranscript(existingTranscript)
-			? existingTranscript
-			: await this.fetchTranscript()
-				|| existingTranscript
-				|| await this.extractTranscriptFromOpenedDom();
+
+		if (this.shouldUseExistingDomTranscript(existingTranscript)) {
+			return this.buildResult(existingTranscript);
+		}
+
+		const transcript = await this.fetchTranscript()
+			|| existingTranscript
+			|| await this.extractTranscriptFromOpenedDom();
 		return this.buildResult(transcript);
 	}
 
@@ -127,9 +150,16 @@ export class YoutubeExtractor extends BaseExtractor {
 		if (!norm) return undefined;
 		const base = norm.split('-')[0];
 		const normalized = captionTracks.map(t => ({ t, code: this.normalizeLanguageCode(t.languageCode) }));
-		return (normalized.find(({ code }) => code === norm)
-			?? normalized.find(({ code }) => code === base)
-			?? normalized.find(({ code }) => code.split('-')[0] === base))?.t;
+
+		// At each specificity level, prefer non-ASR tracks
+		const findBest = (predicate: (item: { t: any; code: string }) => boolean) => {
+			const matches = normalized.filter(predicate);
+			return (matches.find(({ t }) => t.kind !== 'asr') ?? matches[0])?.t;
+		};
+
+		return findBest(({ code }) => code === norm)
+			?? findBest(({ code }) => code === base)
+			?? findBest(({ code }) => code.split('-')[0] === base);
 	}
 
 	private pickCaptionTrack(captionTracks: any[]): any | undefined {
@@ -138,7 +168,11 @@ export class YoutubeExtractor extends BaseExtractor {
 			const match = this.findPreferredCaptionTrack(captionTracks, preferredLang);
 			if (match) return match;
 		}
-		return captionTracks.find((track: any) => track.languageCode === 'en') || captionTracks[0];
+
+		// Prefer manually uploaded tracks over auto-generated (ASR) ones
+		const nonAsr = captionTracks.filter((track: any) => track.kind !== 'asr');
+		const pool = nonAsr.length > 0 ? nonAsr : captionTracks;
+		return pool.find((track: any) => track.languageCode === 'en') || pool[0];
 	}
 
 	private getTrackDisplayName(track: any): string {
@@ -487,47 +521,76 @@ export class YoutubeExtractor extends BaseExtractor {
 			const videoId = this.getVideoId();
 			if (!videoId) return undefined;
 
-			// Fetch captions and chapters in parallel
-			const [playerData, chapters] = await Promise.all([
-				this.fetchPlayerData(videoId),
-				this.fetchChapters(videoId),
-			]);
+			const chaptersPromise = this.fetchChapters(videoId);
 
-			if (!playerData) return undefined;
+			// Start caption XML fetch from inline data immediately (no API needed).
+			// Runs in parallel with the API-based path below.
+			const inlineTrack = this.getInlineCaptionTrack();
+			const inlineXmlPromise = inlineTrack
+				? this.fetchCaptionXml(inlineTrack, chaptersPromise)
+				: undefined;
 
-			const captionTracks = this.getCaptionTracks(playerData);
-			if (captionTracks.length === 0) return undefined;
+			// API-based path: fetch player data for fresh caption tracks
+			const playerData = await this.fetchPlayerData(videoId);
+			const apiTrack = playerData
+				? this.pickCaptionTrack(this.getCaptionTracks(playerData))
+				: undefined;
 
-			// Prefer English, fall back to first available track
-			const track = this.pickCaptionTrack(captionTracks);
-			if (!track?.baseUrl) return undefined;
+			// If the API returned a different/better track, fetch its XML.
+			// Skip if it's the same URL the inline path is already fetching.
+			const apiXmlPromise = apiTrack?.baseUrl && apiTrack.baseUrl !== inlineTrack?.baseUrl
+				? this.fetchCaptionXml(apiTrack, chaptersPromise)
+				: undefined;
 
+			// Prefer API result, fall back to inline
+			const apiResult = apiXmlPromise ? await apiXmlPromise : undefined;
+			if (apiResult) return apiResult;
+
+			return inlineXmlPromise ? await inlineXmlPromise : undefined;
+		} catch (error) {
+			console.error('YoutubeExtractor: failed to fetch transcript', error);
+			return undefined;
+		}
+	}
+
+	private getInlineCaptionTrack(): any | undefined {
+		const data = this.getValidatedPlayerResponse();
+		const tracks = this.getCaptionTracks(data);
+		if (tracks.length === 0) return undefined;
+		const track = this.pickCaptionTrack(tracks);
+		return track?.baseUrl ? track : undefined;
+	}
+
+	private async fetchCaptionXml(
+		track: { baseUrl: string; languageCode?: string },
+		chaptersPromise: Promise<{ title: string; start: number }[]>,
+	): Promise<TranscriptResult | undefined> {
+		try {
 			// Validate URL to prevent SSRF in server-side contexts
-			try {
-				const captionUrl = new URL(track.baseUrl);
-				if (!captionUrl.hostname.endsWith('.youtube.com')) return undefined;
-			} catch {
-				return undefined;
-			}
+			const captionUrl = new URL(track.baseUrl);
+			if (!captionUrl.hostname.endsWith('.youtube.com')) return undefined;
 
 			const captionHeaders: Record<string, string> = { 'User-Agent': 'Mozilla/5.0' };
 			if (this.options.language) {
 				captionHeaders['Accept-Language'] = this.options.language;
 			}
-			const response = await fetch(track.baseUrl, { headers: captionHeaders, signal: AbortSignal.timeout(4000) });
+			const response = await this.fetch(track.baseUrl, {
+				headers: captionHeaders,
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			});
 			if (!response.ok) return undefined;
 
 			let xml: string;
 			try {
 				xml = await response.text();
-			} catch (textError) {
-				console.error('YoutubeExtractor: response.text() failed:', textError);
+			} catch {
 				return undefined;
 			}
 			if (!xml) return undefined;
+
+			const chapters = await chaptersPromise;
 			return this.parseTranscriptXml(xml, track.languageCode || 'en', chapters);
-		} catch (error) {
-			console.error('YoutubeExtractor: failed to fetch transcript', error);
+		} catch {
 			return undefined;
 		}
 	}
@@ -646,8 +709,36 @@ export class YoutubeExtractor extends BaseExtractor {
 	}
 
 	private async fetchPlayerData(videoId: string): Promise<any> {
-		// Try Android client first (most reliable for caption tracks)
-		let androidTimedOut = false;
+		// Try iOS client first — doesn't require a special User-Agent header,
+		// so it works in browser extensions where User-Agent is a forbidden header.
+		try {
+			const iosHeaders: Record<string, string> = {
+				'Content-Type': 'application/json',
+			};
+			if (this.options.language) {
+				iosHeaders['Accept-Language'] = this.options.language;
+			}
+			const resp = await this.fetch(INNERTUBE_API_URL, {
+				method: 'POST',
+				headers: iosHeaders,
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+				body: JSON.stringify({
+					context: INNERTUBE_IOS_CONTEXT,
+					videoId,
+				})
+			});
+			if (resp.ok) {
+				const data = await resp.json();
+				if (this.getCaptionTracks(data).length > 0) {
+					return data;
+				}
+			}
+		} catch {
+			// iOS client failed — fall through to Android client
+		}
+
+		// Try Android client (requires matching User-Agent — works server-side
+		// and in content scripts on youtube.com, but not from extension pages)
 		try {
 			const headers: Record<string, string> = {
 				'Content-Type': 'application/json',
@@ -656,10 +747,10 @@ export class YoutubeExtractor extends BaseExtractor {
 			if (this.options.language) {
 				headers['Accept-Language'] = this.options.language;
 			}
-			const resp = await fetch(INNERTUBE_API_URL, {
+			const resp = await this.fetch(INNERTUBE_API_URL, {
 				method: 'POST',
 				headers,
-				signal: AbortSignal.timeout(4000),
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 				body: JSON.stringify({
 					context: INNERTUBE_CONTEXT,
 					videoId,
@@ -671,16 +762,11 @@ export class YoutubeExtractor extends BaseExtractor {
 					return data;
 				}
 			}
-		} catch (e: any) {
-			// If the Android request timed out, YouTube is likely throttling this IP.
-			// Skip the WEB fallback to avoid doubling the wait time.
-			if (e?.name === 'TimeoutError') {
-				androidTimedOut = true;
-			}
+		} catch {
+			// Android client failed — fall through to WEB client
 		}
 
-		// Try WEB client as fallback — rate-limited independently from Android client
-		if (androidTimedOut) return undefined;
+		// Try WEB client as last API fallback
 		try {
 			const webHeaders: Record<string, string> = {
 				'Content-Type': 'application/json',
@@ -688,10 +774,10 @@ export class YoutubeExtractor extends BaseExtractor {
 			if (this.options.language) {
 				webHeaders['Accept-Language'] = this.options.language;
 			}
-			const resp = await fetch(INNERTUBE_API_URL, {
+			const resp = await this.fetch(INNERTUBE_API_URL, {
 				method: 'POST',
 				headers: webHeaders,
-				signal: AbortSignal.timeout(4000),
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 				body: JSON.stringify({
 					context: INNERTUBE_WEB_CONTEXT,
 					videoId,
@@ -704,12 +790,14 @@ export class YoutubeExtractor extends BaseExtractor {
 				}
 			}
 		} catch {
-			// Fall back to inline page data below.
+			// Fall through to unvalidated inline data below.
 		}
 
-		const inlineData = this.parseInlineJson('ytInitialPlayerResponse');
-		if (this.getCaptionTracks(inlineData).length > 0) {
-			return inlineData;
+		// Last resort: unvalidated inline data (may be stale after SPA navigation,
+		// but better than nothing when all API calls fail)
+		const fallbackData = this.parseInlineJson('ytInitialPlayerResponse');
+		if (this.getCaptionTracks(fallbackData).length > 0) {
+			return fallbackData;
 		}
 
 		return undefined;
@@ -724,10 +812,10 @@ export class YoutubeExtractor extends BaseExtractor {
 			if (this.options.language) {
 				chapterHeaders['Accept-Language'] = this.options.language;
 			}
-			const resp = await fetch(INNERTUBE_NEXT_URL, {
+			const resp = await this.fetch(INNERTUBE_NEXT_URL, {
 				method: 'POST',
 				headers: chapterHeaders,
-				signal: AbortSignal.timeout(4000),
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 				body: JSON.stringify({
 					context: INNERTUBE_WEB_CONTEXT,
 					videoId,
@@ -831,6 +919,9 @@ export class YoutubeExtractor extends BaseExtractor {
 				text = inner.replace(/<[^>]+>/g, '');
 			}
 
+			// Collapse subtitle line breaks to spaces
+			text = text.replace(/\n/g, ' ').replace(/\s{2,}/g, ' ');
+
 			// Decode HTML entities
 			text = this.decodeEntities(text);
 
@@ -844,7 +935,7 @@ export class YoutubeExtractor extends BaseExtractor {
 			const textRegex = /<text\s+start="([^"]*)"[^>]*>([\s\S]*?)<\/text>/g;
 			while ((match = textRegex.exec(xml)) !== null) {
 				const start = parseFloat(match[1]);
-				let text = this.decodeEntities(match[2].replace(/<[^>]+>/g, ''));
+				let text = this.decodeEntities(match[2].replace(/<[^>]+>/g, '').replace(/\n/g, ' ').replace(/\s{2,}/g, ' '));
 				if (text.trim()) {
 					segments.push({ start, text: text.trim() });
 				}
@@ -886,13 +977,13 @@ export class YoutubeExtractor extends BaseExtractor {
 
 	/**
 	 * Group raw transcript segments into readable blocks.
-	 * If speaker markers (>>) are present, groups by speaker turn.
+	 * If speaker markers (>> or -) are present, groups by speaker turn.
 	 * Otherwise, groups by sentence boundaries.
 	 */
 	private groupTranscriptSegments(segments: { start: number; text: string }[]): { start: number; text: string; speakerChange: boolean; speaker?: number }[] {
 		if (segments.length === 0) return [];
 
-		const hasSpeakerMarkers = segments.some(s => /^>>/.test(s.text));
+		const hasSpeakerMarkers = segments.some(s => SPEAKER_MARKER.test(s.text));
 		return hasSpeakerMarkers
 			? this.groupBySpeaker(segments)
 			: this.groupBySentence(segments);
@@ -912,13 +1003,13 @@ export class YoutubeExtractor extends BaseExtractor {
 
 		let prevSegText = '';
 		for (const seg of segments) {
-			const isSpeakerChange = /^>>/.test(seg.text);
-			const cleanText = seg.text.replace(/^>>\s*/, '').replace(/^-\s+/, '');
+			const isSpeakerChange = SPEAKER_MARKER.test(seg.text);
+			const cleanText = seg.text.replace(SPEAKER_STRIP, '');
 
-			// Only treat >> as a real speaker change if the previous segment
+			// Only treat a marker as a real speaker change if the previous segment
 			// ended at a sentence boundary — otherwise it's a mid-sentence
 			// false positive from auto-captions
-			const prevEndsWithComma = /,\s*$/.test(prevSegText);
+			const prevEndsWithComma = TRAILING_COMMA.test(prevSegText);
 			const prevEndedSentence = (SENTENCE_END.test(prevSegText) || !prevSegText) && !prevEndsWithComma;
 			const isRealSpeakerChange = isSpeakerChange && prevEndedSentence;
 
@@ -1079,41 +1170,97 @@ export class YoutubeExtractor extends BaseExtractor {
 	 */
 	private groupBySentence(segments: { start: number; text: string }[]): { start: number; text: string; speakerChange: boolean; speaker?: number }[] {
 		const groups: { start: number; text: string; speakerChange: boolean }[] = [];
-		let buffer = '';
-		let bufferStart = 0;
-		let lastStart = 0;
+		const pending: { start: number; text: string }[] = [];
 
-		const flush = () => {
-			if (buffer.trim()) {
-				groups.push({
-					start: bufferStart,
-					text: buffer.trim(),
-					speakerChange: false,
-				});
-				buffer = '';
+		const pushGroup = (segs: { start: number; text: string }[]) => {
+			const text = segs.map(s => s.text).join(' ').trim();
+			if (text) {
+				groups.push({ start: segs[0].start, text, speakerChange: false });
 			}
+		};
+
+		const flushAll = () => {
+			if (pending.length === 0) return;
+			pushGroup(pending);
+			pending.length = 0;
+		};
+
+		const flushUpTo = (idx: number) => {
+			if (idx <= 0) return;
+			pushGroup(pending.splice(0, idx));
 		};
 
 		for (const seg of segments) {
 			// YouTube often emits sparse caption windows 10-15s apart even when the
 			// sentence is still continuing, so only treat very large gaps as breaks.
-			if (buffer && seg.start - lastStart > TRANSCRIPT_GROUP_GAP_SECONDS) {
-				flush();
+			if (pending.length > 0 && seg.start - pending[pending.length - 1].start > TRANSCRIPT_GROUP_GAP_SECONDS) {
+				flushAll();
 			}
 
-			if (!buffer) {
-				bufferStart = seg.start;
-			}
-			buffer += (buffer ? ' ' : '') + seg.text;
-			lastStart = seg.start;
+			pending.push(seg);
 
-			// Only flush when the segment itself ends with sentence punctuation
 			if (SENTENCE_END.test(seg.text)) {
-				flush();
+				flushAll();
+				continue;
+			}
+
+			// For unpunctuated ASR transcripts, break at the best natural
+			// point once the group exceeds TRANSCRIPT_MAX_GROUP_SECONDS.
+			if (seg.start - pending[0].start >= TRANSCRIPT_MAX_GROUP_SECONDS) {
+				const breakIdx = this.findNaturalBreak(pending);
+				if (breakIdx > 0 && breakIdx < pending.length) {
+					flushUpTo(breakIdx);
+				} else {
+					flushAll();
+				}
 			}
 		}
 
-		flush();
+		flushAll();
 		return groups;
 	}
-} 
+
+	/**
+	 * Find the best natural break point in a list of segments.
+	 * Prefers mid-text sentence boundaries (". A") over gap-based breaks.
+	 * May splice a segment in two when a sentence boundary is found mid-text.
+	 * Returns the index to break BEFORE (i.e., flush segments 0..idx-1).
+	 */
+	private findNaturalBreak(segments: { start: number; text: string }[]): number {
+		if (segments.length <= 1) return -1;
+
+		const minStart = segments[0].start + TRANSCRIPT_MAX_GROUP_SECONDS / 2;
+
+		// Priority 1: last segment containing a mid-text sentence boundary.
+		// Split that segment so the boundary falls at a clean edge.
+		for (let i = segments.length - 1; i >= 0; i--) {
+			if (segments[i].start < minStart) break;
+			const match = segments[i].text.match(MID_TEXT_SENTENCE_BOUNDARY);
+			if (match) {
+				const before = match[1] ?? match[3];
+				const after = match[2] ?? match[4];
+				const start = segments[i].start;
+				segments.splice(i, 1,
+					{ start, text: before },
+					{ start, text: after },
+				);
+				return i + 1;
+			}
+		}
+
+		// Priority 2: largest gap (natural pause) in the eligible range.
+		let bestIdx = -1;
+		let bestGap = 0;
+
+		for (let i = 1; i < segments.length; i++) {
+			if (segments[i].start < minStart) continue;
+			const gap = segments[i].start - segments[i - 1].start;
+			if (gap >= bestGap) {
+				bestGap = gap;
+				bestIdx = i;
+			}
+		}
+
+		return bestIdx;
+	}
+}

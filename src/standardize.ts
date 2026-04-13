@@ -6,16 +6,21 @@ import {
 	INLINE_ELEMENTS,
 	ALLOWED_ATTRIBUTES,
 	ALLOWED_ATTRIBUTES_DEBUG,
-	ALLOWED_EMPTY_ELEMENTS
+	ALLOWED_EMPTY_ELEMENTS,
+	TAILWIND_COLORS,
+	TAILWIND_SPECIAL,
+	TW_COLOR_CLASS_RE,
+	TW_SPECIAL_CLASS_RE,
+	TW_ARBITRARY_RE
 } from './constants';
 
 import { DefuddleMetadata } from './types';
 import { mathRules } from './elements/math';
 import { wrapRawLatexDelimiters } from './elements/math.base';
 import { codeBlockRules } from './elements/code';
-import { headingRules, removePermalinkAnchors } from './elements/headings';
+import { headingRules, removePermalinkAnchors, isPermalinkAnchor } from './elements/headings';
 import { imageRules } from './elements/images';
-import { isElement, isTextNode, isCommentNode, getComputedStyle, logDebug } from './utils';
+import { isElement, isTextNode, isCommentNode, isSVGElement, getComputedStyle, logDebug } from './utils';
 import { transferContent, isDirectTableChild, getClassName } from './utils/dom';
 
 // Module-level debug flag, set by standardizeContent for child functions
@@ -164,8 +169,10 @@ export function standardizeContent(element: Element, metadata: DefuddleMetadata,
 	step('standardizeHeadings', () => standardizeHeadings(element, metadata.title, doc));
 	step('wrapPreformattedCode', () => wrapPreformattedCode(element, doc));
 	step('standardizeElements', () => standardizeElements(element, doc, subProfile));
+	step('resolveSvgColors', () => resolveSvgColors(element, doc));
 
 	if (!debug) {
+		step('convertBlockSpans', () => convertBlockSpans(element, doc));
 		step('flattenWrapperElements[1]', () => flattenWrapperElements(element, doc));
 		step('removePermalinkAnchors', () => removePermalinkAnchors(element));
 		step('stripUnwantedAttributes', () => stripUnwantedAttributes(element, debug));
@@ -242,10 +249,10 @@ function wrapPreformattedCode(element: Element, doc: Document): void {
 
 function standardizeSpaces(element: Element): void {
 	const processNode = (node: Node) => {
-		// Skip pre and code elements
+		// Skip pre, code, and SVG elements
 		if (isElement(node)) {
 			const tag = (node as Element).tagName.toLowerCase();
-			if (tag === 'pre' || tag === 'code') {
+			if (tag === 'pre' || tag === 'code' || isSVGElement(node as Element)) {
 				return;
 			}
 		}
@@ -349,6 +356,25 @@ export function removeOrphanedDividers(element: Element): void {
 			break;
 		}
 	}
+
+	// Collapse consecutive <hr> elements (skipping whitespace text nodes between them)
+	for (const hr of element.querySelectorAll('hr')) {
+		if (!hr.parentNode) continue;
+		let node: Node | null = hr.nextSibling;
+		while (node) {
+			if (isTextNode(node) && !(node.textContent || '').trim()) {
+				node = node.nextSibling;
+				continue;
+			}
+			if (isElement(node) && (node as Element).tagName === 'HR') {
+				const next = node.nextSibling;
+				(node as Element).remove();
+				node = next;
+				continue;
+			}
+			break;
+		}
+	}
 }
 
 function standardizeHeadings(element: Element, title: string, doc: Document): void {
@@ -378,7 +404,12 @@ function standardizeHeadings(element: Element, title: string, doc: Document): vo
 	const h2s = element.getElementsByTagName('h2');
 	if (h2s.length > 0) {
 		const firstH2 = h2s[0];
-		const firstH2Text = normalizeText(firstH2.textContent || '');
+		// Subtract permalink anchor text (e.g. ¶, #, §) which hasn't been stripped yet
+		let permalinkText = '';
+		for (const a of firstH2.querySelectorAll('a')) {
+			if (isPermalinkAnchor(a)) permalinkText += a.textContent || '';
+		}
+		const firstH2Text = normalizeText((firstH2.textContent || '').replace(permalinkText, ''));
 		const normalizedTitle = normalizeText(title);
 		if (normalizedTitle && normalizedTitle === firstH2Text) {
 			firstH2.remove();
@@ -408,8 +439,13 @@ function stripUnwantedAttributes(element: Element, debug: boolean): void {
 	let attributeCount = 0;
 
 	const processElement = (el: Element) => {
-		// Skip SVG elements - preserve all their attributes
-		if (el.tagName.toLowerCase() === 'svg' || el.namespaceURI === 'http://www.w3.org/2000/svg') {
+		// SVG elements: preserve all rendering attributes but strip class
+		// (CSS is no longer available, so classes serve no purpose)
+		if (isSVGElement(el)) {
+			if (!debug && el.hasAttribute('class')) {
+				el.removeAttribute('class');
+				attributeCount++;
+			}
 			return;
 		}
 
@@ -428,7 +464,7 @@ function stripUnwantedAttributes(element: Element, debug: boolean): void {
 					attrValue.startsWith('fn:') || // Footnote content
 					attrValue === 'footnotes' // Footnotes container
 				)) ||
-				// Preserve code block language classes and footnote backref class
+				// Preserve code block language classes, footnote backref class, and callout classes
 				(attrName === 'class' && (
 					(tag === 'code' && attrValue.startsWith('language-')) ||
 					attrValue === 'footnote-backref' ||
@@ -469,6 +505,34 @@ function unwrapElement(el: Element): void {
 	el.remove();
 }
 
+const TW_BLOCK_RE = /(?:^|\s)block(?:\s|$)/;
+const DISPLAY_BLOCK_RE = /display\s*:\s*block/i;
+
+/**
+ * Convert spans styled as block-level paragraphs to <p> elements.
+ * Some sites (e.g. Grokipedia) use <span class="block ..."> with Tailwind
+ * to render paragraph-like blocks. These lose structure after attribute
+ * stripping and bare-span unwrapping.
+ */
+function convertBlockSpans(element: Element, doc: Document): void {
+	let convertedCount = 0;
+	const spans = Array.from(element.querySelectorAll('span[class*="block"], span[style*="block"]'));
+	for (const span of spans) {
+		if (!span.parentNode) continue;
+
+		const isBlock = TW_BLOCK_RE.test(getClassName(span)) ||
+			DISPLAY_BLOCK_RE.test(span.getAttribute('style') || '');
+		if (!isBlock) continue;
+		if (!span.textContent?.trim()) continue;
+
+		const p = doc.createElement('p');
+		transferContent(span, p);
+		span.replaceWith(p);
+		convertedCount++;
+	}
+	logDebug(_debug, 'Converted block spans to paragraphs:', convertedCount);
+}
+
 function unwrapBareSpans(element: Element): void {
 	// Process deepest spans first so nested bare spans collapse in one pass
 	const spans = Array.from(element.querySelectorAll('span')).reverse();
@@ -495,6 +559,236 @@ function unwrapBareSpans(element: Element): void {
 	}
 
 	logDebug(_debug, 'Unwrapped bare spans:', unwrappedCount);
+}
+
+const LIGHT_DARK_RE = /light-dark\(\s*([^,]+?)\s*,\s*[^)]+?\)/g;
+const CSS_VAR_RE = /var\(--([^,)]+)(?:,\s*([^)]+))?\)/;
+const SVG_COLOR_ATTRS = ['fill', 'stroke', 'color', 'stop-color', 'flood-color', 'lighting-color'];
+
+/**
+ * Resolve CSS variables in SVG attributes to concrete color values.
+ * In browser environments, uses getComputedStyle to resolve variables.
+ * In Node/Worker environments (where CSS variables are unavailable),
+ * infers colors from variable names so SVGs remain legible outside the page.
+ */
+function resolveSvgColors(element: Element, doc: Document): void {
+	const svgs = element.querySelectorAll('svg');
+	if (svgs.length === 0) return;
+
+	const defaultView = doc.defaultView;
+	const isBrowser = typeof window !== 'undefined' && defaultView === window;
+	const resolveCache = new Map<string, string>();
+
+	const resolveVar = (value: string, svgParent: Element | null): string => {
+		// Unwrap light-dark(): use the light-mode value
+		value = value.replace(LIGHT_DARK_RE, (_match, lightVal) => lightVal.trim());
+
+		if (!value.includes('var(')) return value;
+
+		if (isBrowser) {
+			const cached = resolveCache.get(value);
+			if (cached) return cached;
+			// Append temp div to nearest HTML ancestor (not inside SVG namespace)
+			const anchor = svgParent || doc.documentElement;
+			try {
+				const temp = doc.createElement('div');
+				temp.style.color = value;
+				anchor.appendChild(temp);
+				const computed = defaultView!.getComputedStyle(temp).color;
+				temp.remove();
+				if (computed && !computed.includes('var(')) {
+					resolveCache.set(value, computed);
+					return computed;
+				}
+			} catch (e) {}
+		}
+
+		// Parse var() — use CSS fallback value if provided
+		const varMatch = value.match(CSS_VAR_RE);
+		if (varMatch) {
+			const fallback = varMatch[2]?.trim();
+			if (fallback && !fallback.includes('var(')) return fallback;
+
+			const name = varMatch[1].toLowerCase();
+
+			// Try to resolve from Tailwind palette (e.g. --color-amber-600)
+			const twMatch = name.match(/(?:^|-)([a-z]+)-(\d{2,3})$/);
+			if (twMatch) {
+				const hex = TAILWIND_COLORS[twMatch[1]]?.[twMatch[2]];
+				if (hex) return hex;
+			}
+			if (name.endsWith('-black')) return '#000';
+			if (name.endsWith('-white')) return '#fff';
+
+			// Semantic fallbacks
+			if (name.includes('background') || name.includes('card') || name.includes('surface') || name.includes('bg')) return 'Canvas';
+			if (name.includes('border') || name.includes('divider') || name.includes('separator')) return '#ccc';
+			if (name.includes('muted') || name.includes('subtle') || name.includes('secondary') || name.includes('placeholder')) return '#888';
+		}
+		return 'currentColor';
+	};
+
+	for (const svg of Array.from(svgs)) {
+		const svgParent = svg.parentElement;
+		const allEls = [svg, ...Array.from(svg.querySelectorAll('*'))];
+		for (const el of allEls) {
+			for (const attrName of SVG_COLOR_ATTRS) {
+				const val = el.getAttribute(attrName);
+				if (!val || (!val.includes('var(') && !val.includes('light-dark('))) continue;
+				el.setAttribute(attrName, resolveVar(val, svgParent));
+			}
+			const style = el.getAttribute('style');
+			if (style && (style.includes('var(') || style.includes('light-dark('))) {
+				let resolved = style.replace(LIGHT_DARK_RE, (_match, lightVal) => lightVal.trim());
+				resolved = resolved.replace(/var\(--[^,)]+(?:,\s*[^)]+)?\)/g, match => resolveVar(match, svgParent));
+				el.setAttribute('style', resolved);
+			}
+			resolveTailwindClasses(el);
+		}
+
+		applySvgFallbackStyles(svg);
+	}
+}
+
+const SVG_FILLED_TAGS = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon']);
+const SVG_STROKE_TAGS = new Set(['line', 'polyline']);
+const SVG_TEXT_TAGS = new Set(['text', 'tspan']);
+const SVG_NON_RENDERED_ANCESTOR = 'defs, clipPath, mask, pattern, marker';
+const GRIDLINE_STROKE_OPACITY = '0.2';
+
+/** Check if an inline style attribute sets a specific CSS property. */
+function hasStyleProp(el: Element, prop: string): boolean {
+	const style = el.getAttribute('style');
+	if (!style) return false;
+	// Match "fill:" but not "fill-opacity:" or "fill-rule:"
+	return new RegExp(`(?:^|;)\\s*${prop}\\s*:`).test(style);
+}
+
+/**
+ * Apply fallback fill/stroke to SVG elements that have class attributes
+ * but lost their CSS-based styling. Only triggers when at least one
+ * filled shape element has a class but no fill — indicating CSS was lost.
+ * Elements inside <defs>, <clipPath>, etc. are skipped.
+ */
+function applySvgFallbackStyles(svg: Element): void {
+	if (svg.querySelector('style')) return;
+
+	const allEls = Array.from(svg.querySelectorAll('*'));
+
+	// Only apply fallbacks if at least one filled shape has a class but no
+	// fill — indicating CSS-based styling was lost.
+	let hasUnstyled = false;
+	for (const el of allEls) {
+		const tag = el.tagName.toLowerCase();
+		if (!SVG_FILLED_TAGS.has(tag)) continue;
+		if (!el.getAttribute('class')) continue;
+		if (el.closest(SVG_NON_RENDERED_ANCESTOR)) continue;
+		if (el.hasAttribute('fill') || hasStyleProp(el, 'fill')) continue;
+		hasUnstyled = true;
+		break;
+	}
+	if (!hasUnstyled) return;
+
+	for (const el of allEls) {
+		const tag = el.tagName.toLowerCase();
+		const isFilled = SVG_FILLED_TAGS.has(tag);
+		const isStroke = SVG_STROKE_TAGS.has(tag);
+		const isText = SVG_TEXT_TAGS.has(tag);
+		if (!isFilled && !isStroke && !isText) continue;
+		if (!el.getAttribute('class')) continue;
+		if (el.closest(SVG_NON_RENDERED_ANCESTOR)) continue;
+
+		if (isText) {
+			if (!el.hasAttribute('fill') && !hasStyleProp(el, 'fill')) {
+				el.setAttribute('fill', 'currentColor');
+			}
+			continue;
+		}
+
+		const hasFill = el.hasAttribute('fill') && el.getAttribute('fill') !== 'none';
+		const hasStrokeAttr = el.hasAttribute('stroke') || hasStyleProp(el, 'stroke');
+
+		if (isFilled && !el.hasAttribute('fill') && !hasStyleProp(el, 'fill')) {
+			el.setAttribute('fill', 'none');
+		}
+
+		if (!hasStrokeAttr) {
+			if (isStroke) {
+				el.setAttribute('stroke', 'currentColor');
+				if (!el.hasAttribute('stroke-opacity')) {
+					el.setAttribute('stroke-opacity', GRIDLINE_STROKE_OPACITY);
+				}
+			} else if (isFilled && !hasFill) {
+				const d = el.getAttribute('d') || '';
+				const isClosed = /Z\s*$/i.test(d.trim());
+				if (!isClosed) {
+					el.setAttribute('stroke', 'currentColor');
+				}
+			}
+		}
+	}
+}
+
+function resolveTailwindClasses(el: Element): void {
+	const className = el.getAttribute('class');
+	if (!className) return;
+
+	const tokens = className.split(/\s+/);
+	const keep: string[] = [];
+	const styles: string[] = [];
+
+	for (const token of tokens) {
+		let match = token.match(TW_COLOR_CLASS_RE);
+		if (match) {
+			const [, prop, color, shade, opacity] = match;
+			const hex = TAILWIND_COLORS[color]?.[shade];
+			if (hex) {
+				if (opacity) {
+					const a = parseInt(opacity) / 100;
+					const r = parseInt(hex.slice(1, 3), 16);
+					const g = parseInt(hex.slice(3, 5), 16);
+					const b = parseInt(hex.slice(5, 7), 16);
+					el.setAttribute(prop, `rgba(${r},${g},${b},${a})`);
+				} else {
+					el.setAttribute(prop, hex);
+				}
+				continue;
+			}
+		}
+
+		match = token.match(TW_SPECIAL_CLASS_RE);
+		if (match) {
+			el.setAttribute(match[1], TAILWIND_SPECIAL[match[2]]);
+			continue;
+		}
+
+		match = token.match(TW_ARBITRARY_RE);
+		if (match && !match[1].startsWith('#') && !match[1].startsWith('rgb') && !match[1].startsWith('hsl')) {
+			styles.push(`font-size:${match[1]}`);
+			continue;
+		}
+
+		if (token === 'font-semibold') { styles.push('font-weight:600'); continue; }
+		if (token === 'font-bold') { styles.push('font-weight:700'); continue; }
+		if (token === 'font-medium') { styles.push('font-weight:500'); continue; }
+		if (token === 'font-mono') { styles.push('font-family:monospace'); continue; }
+
+		keep.push(token);
+	}
+
+	if (keep.length === tokens.length) return; // nothing changed
+
+	if (keep.length > 0) {
+		el.setAttribute('class', keep.join(' '));
+	} else {
+		el.removeAttribute('class');
+	}
+
+	if (styles.length > 0) {
+		const existing = el.getAttribute('style') || '';
+		const sep = existing && !existing.endsWith(';') ? ';' : '';
+		el.setAttribute('style', existing + sep + styles.join(';'));
+	}
 }
 
 function removeEmptyElements(element: Element): void {
@@ -1050,6 +1344,9 @@ function flattenWrapperElements(element: Element, doc: Document): void {
 
 	const shouldPreserveElement = (el: Element): boolean => {
 		const tagName = el.tagName.toLowerCase();
+
+		// Preserve SVG elements and all their children
+		if (isSVGElement(el)) return true;
 
 		// Check if element should be preserved
 		if (PRESERVE_ELEMENTS.has(tagName)) return true;

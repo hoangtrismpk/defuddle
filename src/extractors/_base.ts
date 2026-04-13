@@ -3,6 +3,7 @@ import { ExtractorResult, ExtractorVariables, ExtractedContent } from '../types/
 export interface ExtractorOptions {
 	includeReplies?: boolean | 'extractors';
 	language?: string;
+	fetch?: typeof globalThis.fetch;
 }
 
 export abstract class BaseExtractor {
@@ -16,6 +17,11 @@ export abstract class BaseExtractor {
 		this.url = url;
 		this.schemaOrgData = schemaOrgData;
 		this.options = options || {};
+	}
+
+	protected get fetch(): typeof globalThis.fetch {
+		const fn = this.options.fetch || globalThis.fetch;
+		return fn.bind(globalThis);
 	}
 
 	abstract canExtract(): boolean;

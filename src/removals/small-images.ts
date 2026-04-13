@@ -1,5 +1,6 @@
 import { logDebug } from '../utils';
 import { getClassName } from '../utils/dom';
+import { isBase64Placeholder } from '../elements/images';
 
 const STYLE_WIDTH_PATTERN = /width\s*:\s*(\d+)/;
 const STYLE_HEIGHT_PATTERN = /height\s*:\s*(\d+)/;
@@ -45,6 +46,19 @@ export function findSmallImages(doc: Document, debug: boolean): Set<string> {
 		const attrWidth = parseInt(element.getAttribute('width') || '0');
 		const attrHeight = parseInt(element.getAttribute('height') || '0');
 
+		// For SVGs, use viewBox dimensions as fallback when no explicit width/height
+		let viewBoxWidth = 0, viewBoxHeight = 0;
+		if (element.tagName.toLowerCase() === 'svg') {
+			const viewBox = element.getAttribute('viewBox');
+			if (viewBox) {
+				const parts = viewBox.split(/[\s,]+/);
+				if (parts.length === 4) {
+					viewBoxWidth = parseFloat(parts[2]) || 0;
+					viewBoxHeight = parseFloat(parts[3]) || 0;
+				}
+			}
+		}
+
 		// Check inline style dimensions
 		const style = element.getAttribute('style') || '';
 		const styleWidth = parseInt(style.match(STYLE_WIDTH_PATTERN)?.[1] || '0');
@@ -65,12 +79,12 @@ export function findSmallImages(doc: Document, debug: boolean): Set<string> {
 			} catch (e) {}
 		}
 
-		const widths = [attrWidth, styleWidth, computedWidth].filter(d => d > 0);
-		const heights = [attrHeight, styleHeight, computedHeight].filter(d => d > 0);
+		const widths = [attrWidth, styleWidth, computedWidth, viewBoxWidth].filter(d => d > 0);
+		const heights = [attrHeight, styleHeight, computedHeight, viewBoxHeight].filter(d => d > 0);
 
-		if (widths.length > 0 && heights.length > 0) {
-			const effectiveWidth = Math.min(...widths);
-			const effectiveHeight = Math.min(...heights);
+		if (widths.length > 0 || heights.length > 0) {
+			const effectiveWidth = widths.length > 0 ? Math.min(...widths) : Infinity;
+			const effectiveHeight = heights.length > 0 ? Math.min(...heights) : Infinity;
 
 			if (effectiveWidth < MIN_DIMENSION || effectiveHeight < MIN_DIMENSION) {
 				const identifier = getElementIdentifier(element);
@@ -93,14 +107,25 @@ export function removeSmallImages(doc: Document, smallImages: Set<string>, debug
 		const elements = doc.getElementsByTagName(tag);
 		Array.from(elements).forEach(element => {
 			// Remove images with no source information at all (broken/empty images)
+			// or unresolvable base64 placeholder images (e.g. lazy-loaded images
+			// where JS never ran to inject the real URL)
 			if (tag === 'img') {
-				const hasSrc = element.getAttribute('src') ||
+				const src = element.getAttribute('src') || '';
+				const hasAltSrc =
 					element.getAttribute('srcset') ||
 					element.getAttribute('data-src') ||
 					element.getAttribute('data-srcset') ||
 					element.getAttribute('data-lazy-src') ||
 					element.getAttribute('data-original');
-				if (!hasSrc) {
+				if (!src && !hasAltSrc) {
+					element.remove();
+					removedCount++;
+					return;
+				}
+				// Base64 placeholder with no alternative source — unresolvable.
+				// Skip images inside <picture>; the picture transform will
+				// resolve them from <source> srcsets.
+				if (!hasAltSrc && !element.closest('picture') && isBase64Placeholder(src)) {
 					element.remove();
 					removedCount++;
 					return;
