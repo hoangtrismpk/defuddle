@@ -6,6 +6,7 @@ export const ENTRY_POINT_ELEMENTS = [
 	'.post-body',
 	'.article-content',
 	'#article-content',
+	'.js-article-content',
 	'.article_post',
 	'.article-wrapper',
 	'.entry-content',
@@ -79,8 +80,12 @@ const HIDDEN_EXACT_SKIP_SELECTORS = [
 	'.invisible',
 ];
 
+// Paywall sites (e.g. Future PLC) mark gated paragraphs with
+// aria-hidden="true" + class="paywall". Preserve those so the
+// article text isn't stripped, which would trigger a low-word-count
+// retry with partial selectors disabled.
 const HIDDEN_EXACT_SELECTORS = HIDDEN_EXACT_SKIP_SELECTORS.map(s =>
-	s === '[aria-hidden="true"]' ? '[aria-hidden="true"]:not([class*="math"]):not(svg)' : s
+	s === '[aria-hidden="true"]' ? '[aria-hidden="true"]:not([class*="math"]):not(svg):not([class*="paywall"])' : s
 );
 
 // Pre-joined selector strings (these arrays are constant)
@@ -96,7 +101,11 @@ export const EXACT_SELECTORS = [
 	'link',
 
 	// empty media elements (src set by JS at runtime, not in raw HTML)
-	'audio:not([src])',
+	'audio:not([src]):not(:has(source))',
+	'video:not([src]):not(:has(source))',
+
+	// JW Player embeds (removes entire player including controls, shortcuts, overlays)
+	'.jwplayer',
 
 	// ads
 	'.ad:not([class*="gradient"])',
@@ -111,6 +120,7 @@ export const EXACT_SELECTORS = [
 	'.Promo',
 	'#barrier-page', // ft.com
 	'.alert',
+	'[rel="sponsored" i]',
 
 	// comments
 	'[id="comments" i]',
@@ -127,7 +137,7 @@ export const EXACT_SELECTORS = [
 	// Exclude headers that contain multiple paragraphs — some sites (e.g. Webflow blogs)
 	// use <header> as the main content wrapper rather than a navigation container.
 	// A single <p> (subtitle/deck) is still a page header, not article content.
-	'header:not(:has(p + p))',
+	'header:not(:has(p + p)):not(:has(img))',
 	'.header:not(.banner)',
 	'#header',
 	'#Header',
@@ -139,6 +149,7 @@ export const EXACT_SELECTORS = [
 	// '.hero', // see issue #132
 	'[role="navigation" i]',
 	'[role="dialog" i]',
+	'[role="alertdialog" i]',
 	'[role*="complementary" i]',
 	'[class*="pagination" i]',
 	'.menu',
@@ -205,6 +216,19 @@ export const EXACT_SELECTORS = [
 	'fieldset',
 	'form',
 	'input:not([type="checkbox"])',
+	// UI toggle checkboxes (sidebar/menu/nav/drawer/hamburger patterns).
+	// Markdown task list checkboxes use class="task-list-item-checkbox", so
+	// none of these patterns affect them.
+	'input[type="checkbox"][class*="sidebar" i]',
+	'input[type="checkbox"][id*="sidebar" i]',
+	'input[type="checkbox"][class*="drawer" i]',
+	'input[type="checkbox"][id*="drawer" i]',
+	'input[type="checkbox"][class*="hamburger" i]',
+	'input[type="checkbox"][id*="hamburger" i]',
+	'input[type="checkbox"][class*="toggle" i]',
+	'input[type="checkbox"][id*="toggle" i]',
+	'input[type="checkbox"][class*="trigger" i]',
+	'input[type="checkbox"][id*="trigger" i]',
 	'label',
 	'option',
 	'select',
@@ -223,6 +247,7 @@ export const EXACT_SELECTORS = [
 	// iframes
 	'instaread-player',
 	'iframe:not([src])',
+	'iframe[src*="trinitymedia.ai"]',
 
 	// logos
 	'[class="logo" i]',
@@ -270,7 +295,12 @@ export const EXACT_SELECTORS = [
 	'[data-link-name*="skip" i]',
 	'[aria-label*="skip" i]',
 
+	// dismiss/close buttons
+	'[aria-label="Dismiss" i]',
+	'[aria-label="Close" i]',
+
 	// other
+	'[data-testid="load-more-posts"] + div', // NY Times lazy loader
 	'.copyright',
 	'#copyright',
 	'.licensebox',
@@ -280,7 +310,7 @@ export const EXACT_SELECTORS = [
 	'.gutter',
 	'#primaryaudio', // NPR
 	'#NYT_ABOVE_MAIN_CONTENT_REGION',
-	'[data-testid="photoviewer-children-figure"] > span', // New York Times
+	'[data-testid="photoviewer-children-figure"] > span', // NY Times
 	'table.infobox',
 	'[data-optimizely="related-articles-section" i]', // The Economist
 	'[data-orientation="vertical"]',
@@ -338,6 +368,7 @@ export const PARTIAL_SELECTORS = [
 	'article-category',
 	'article-card',
 	'article-citation',
+	'article-continues',
 	'article__copy',
 	'article_date',
 	'article-date',
@@ -405,6 +436,8 @@ export const PARTIAL_SELECTORS = [
 	'bcrumb',
 	'breadcrumb',
 	'brdcrumb',
+	'crumbs',
+	'bubblewrapper',
 	'button-wrapper',
 	'buttons-container',
 	'btn-',
@@ -426,7 +459,7 @@ export const PARTIAL_SELECTORS = [
 	'chapter-list', // The Economist
 	'collections',
 	'comments',
-	'-comment', // comments in code blocks are skipped in removeBySelector
+	'-comment\\b', // word boundary avoids false matches like Wikipedia's 'rt-commentedText'. Comments in code blocks are skipped in removeBySelector
 	'commentbox',
 	'comment-button',
 	'commentcomp',
@@ -442,6 +475,7 @@ export const PARTIAL_SELECTORS = [
 	'contact-',
 	'content-card', // The Verge
 	'copycontent',
+	'copy-tooltip',
 	'content-topics',
 	'contentpromo',
 	'context-bar',
@@ -521,7 +555,7 @@ export const PARTIAL_SELECTORS = [
 	'fullbleedheader',
 	
 	'gallery-count',
-	'gated-',
+	'gated-popup',
 	'gh-feed',
 	'gist-meta',
 //	'global',
@@ -530,11 +564,10 @@ export const PARTIAL_SELECTORS = [
 	'graph-view',
 
 	'hamburger',
-	'header_logo',
-	'header-logo',
+	'hawk-', // Future PLC affiliate deal widgets
 	'header-pattern', // The Verge
 //	'headlines', Mercurynews
-	'hero-list',
+	'hero[_\\-a-z]',
 //	'-hidden',
 	'hide-for-print',
 	'hide-print',
@@ -544,6 +577,8 @@ export const PARTIAL_SELECTORS = [
 	'hidden-accessibility',
 	'home-link',
 
+	'icon-sidebar',
+	'inarticle-ad',
 	'infoline',
 	'inline-topic',
 	'instacartIntegration',
@@ -584,10 +619,11 @@ export const PARTIAL_SELECTORS = [
 	'links-title', // BBC
 	'listing-dynamic-terms', // Boston Review
 	'list-tags',
+	'live-blog-header-live-label', // NY Times
 	'listinks',
 	'loading',
 	'loa-info',
-	'logo_container',
+	'logo',
 	'ltx_role_refnum', // Arxiv
 	'ltx_tag_bibitem',
 	'ltx_error',
@@ -759,6 +795,7 @@ export const PARTIAL_SELECTORS = [
 	'robots-nocontent',
 	'_rss',
 	'rss-link',
+	'rubricwrapper',
 
 	'screen-reader-text',
 	'scroll_to',
@@ -773,11 +810,14 @@ export const PARTIAL_SELECTORS = [
 	'sharedaddy',
 	'share-icons',
 	'sharelinks',
+	'share-links',
 	'share-post',
 	'share-print',
 	'share-section',
+	'share-text',
 	'sharing_',
 	'shariff-',
+	'shortcode-id',
 	'show-for-print',
 	'sidebartitle',
 //	'sidebar_',
@@ -787,7 +827,6 @@ export const PARTIAL_SELECTORS = [
 	'sidebar-author',
 	'sidebar-item',
 	'side-box',
-	'side-logo',
 	'sign-in-gate',
 	'similar-',
 	'similar_',
@@ -795,7 +834,6 @@ export const PARTIAL_SELECTORS = [
 	'site-index',
 	'site-header',
 	'siteheader',
-	'site-logo',
 	'site-name',
 	'site-wordpress',
 //	'skip-',
@@ -871,12 +909,12 @@ export const PARTIAL_SELECTORS = [
 	'trust-badge',
 	'trust-project',
 	'chakra-badge',
-	'twitter',
 	'twiblock',
 
 	'u-hide',
 	'upsell',
 
+	'vid_carousel',
 	'viewbottom',
 	'view-language',
 	'yarpp-related',
@@ -920,8 +958,10 @@ export const FOOTNOTE_INLINE_REFERENCES = [
 	'a[id^="fnref"]',
 	'a[id^="ref-link"]', // Nature.com
 	'sup.footnoteref', // Wikidot
+	'sup.footnote-reference', // pulldown-cmark / mdBook / zola
 	'sup[data-fn] > a[href^="#"]', // WordPress block editor footnotes
 	'sup[id^="ftnt_ref"] a[href^="#ftnt"]', // Google Docs/Sites
+	'span.easy-footnote > a[href^="#easy-footnote-bottom-"]', // Easy Footnotes WP plugin
 ].join(',');
 
 export const FOOTNOTE_LIST_SELECTORS = [
@@ -942,7 +982,9 @@ export const FOOTNOTE_LIST_SELECTORS = [
 	'div.footnote[data-component-name="FootnoteToDOM"]', // Substack
 	'div.footnotes-footer', // Wikidot
 	'div.footnote-definitions',
+	'div.footnote-definition', // pulldown-cmark / mdBook / zola (unwrapped)
 	'ol.wp-block-footnotes', // WordPress block editor footnotes
+	'ol.easy-footnotes-wrapper', // Easy Footnotes WP plugin
 	'#footnotes' // standardizeFootnotes output container
 ].join(',');
 

@@ -16,7 +16,7 @@ import { ContentScorer, ContentScore } from './removals/scoring';
 import { findSmallImages, removeSmallImages } from './removals/small-images';
 import { removeHiddenElements } from './removals/hidden';
 import { removeBySelector } from './removals/selectors';
-import { removeByContentPattern } from './removals/content-patterns';
+import { removeByContentPattern, removeEyebrowLabel } from './removals/content-patterns';
 import { removeMetadataBlock } from './removals/metadata-block';
 import { getComputedStyle, textPreview, countWords, isSVGElement } from './utils';
 import { parseHTML, serializeHTML, decodeHTMLEntities, isDangerousUrl, getClassName } from './utils/dom';
@@ -774,6 +774,15 @@ export class Defuddle {
 					found = this.findMainContent(clone);
 				}
 
+				// If the selected element is inside defuddle extractor output,
+				// expand to the whole container so post + comments stay together.
+				if (found) {
+					const defuddleAncestor = found.closest('[data-defuddle]');
+					if (defuddleAncestor) {
+						found = defuddleAncestor;
+					}
+				}
+
 				// If we fell back to <body>, try using schema.org articleBody/text
 				// to find a more specific content element within the DOM.
 				if (found && found.tagName.toLowerCase() === 'body') {
@@ -835,6 +844,15 @@ export class Defuddle {
 				}
 			});
 
+			// Remove "eyebrow" category labels before selector removal — these
+			// are anchored on the first <h1>, which some sites strip via class
+			// (e.g. Substack's .post-title) in the selector phase.
+			profileStep('removeEyebrowLabel', () => {
+				if (options.removeContentPatterns && mainContent) {
+					removeEyebrowLabel(mainContent!, this.debug, debugRemovals);
+				}
+			});
+
 			// Remove clutter using selectors — deterministic removal of known
 			// non-content elements (nav, footer, .sidebar, etc.) by class/id.
 			// Runs before scoring so the heuristic scorer sees a cleaner DOM.
@@ -864,7 +882,7 @@ export class Defuddle {
 			profileStep('removeByContentPattern', () => {
 				if (options.removeContentPatterns && mainContent) {
 					const url = this.options.url || this.doc.URL || '';
-					removeByContentPattern(mainContent!, this.debug, url, debugRemovals);
+					removeByContentPattern(mainContent!, this.debug, url, metadata.title || '', debugRemovals);
 				}
 			});
 
@@ -1145,7 +1163,19 @@ export class Defuddle {
 		}
 
 		const cells = Array.from(doc.getElementsByTagName('td'));
-		return ContentScorer.findBestElement(cells);
+		const bestCell = ContentScorer.findBestElement(cells);
+		if (!bestCell) return null;
+
+		// If there's more text outside the best cell than inside it,
+		// tables are peripheral (TOC, intro boxes, data tables) — not the
+		// main content container. Fall back to body.
+		const bestCellWords = countWords(bestCell.textContent || '');
+		const bodyWords = countWords((doc.body || doc.documentElement).textContent || '');
+		if (bestCellWords * 2 < bodyWords) {
+			return null;
+		}
+
+		return bestCell;
 	}
 
 	private findContentByScoring(doc: Document): Element | null {

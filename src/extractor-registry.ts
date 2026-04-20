@@ -15,6 +15,13 @@ import { XOembedExtractor } from './extractors/x-oembed';
 import { BbcodeDataExtractor } from './extractors/bbcode-data';
 import { C2WikiExtractor } from './extractors/c2-wiki';
 import { SubstackExtractor } from './extractors/substack';
+import { NytimesExtractor } from './extractors/nytimes';
+import { WikipediaExtractor } from './extractors/wikipedia';
+import { LinkedInExtractor } from './extractors/linkedin';
+import { ThreadsExtractor } from './extractors/threads';
+import { BlueskyExtractor } from './extractors/bluesky';
+import { DiscourseExtractor } from './extractors/discourse';
+import { MediumExtractor } from './extractors/medium';
 
 type ExtractorConstructor = new (document: Document, url: string, schemaOrgData?: any, options?: ExtractorOptions) => BaseExtractor;
 
@@ -76,7 +83,7 @@ export class ExtractorRegistry {
 
 		this.register({
 			patterns: [
-				/news\.ycombinator\.com\/item\?id=.*/
+				'news.ycombinator.com',
 			],
 			extractor: HackerNewsExtractor
 		});
@@ -120,6 +127,37 @@ export class ExtractorRegistry {
 
 		this.register({
 			patterns: [
+				'linkedin.com',
+			],
+			extractor: LinkedInExtractor
+		});
+
+		this.register({
+			patterns: [
+				'threads.net',
+				'www.threads.com',
+				'threads.com',
+			],
+			extractor: ThreadsExtractor
+		});
+
+		this.register({
+			patterns: [
+				'bsky.app',
+			],
+			extractor: BlueskyExtractor
+		});
+
+		this.register({
+			patterns: [
+				'medium.com',
+				/\.medium\.com/,
+			],
+			extractor: MediumExtractor
+		});
+
+		this.register({
+			patterns: [
 				'wiki.c2.com',
 			],
 			extractor: C2WikiExtractor
@@ -132,6 +170,25 @@ export class ExtractorRegistry {
 				'substack.com',
 			],
 			extractor: SubstackExtractor
+		});
+
+		this.register({
+			patterns: [
+				'nytimes.com',
+			],
+			extractor: NytimesExtractor
+		});
+
+		this.register({
+			patterns: [
+				'wikipedia.org',
+			],
+			extractor: WikipediaExtractor
+		});
+
+		this.register({
+			patterns: [/\/t\/[^/]+\/\d+/],
+			extractor: DiscourseExtractor
 		});
 
 		this.register({

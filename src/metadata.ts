@@ -65,10 +65,25 @@ export class MetadataExtractor {
 		};
 	}
 
-	// Returns true if the string looks like an unresolved template literal
-	// e.g. "#author.fullName}" (missing opening brace), "{{author}}", etc.
-	private static isTemplateArtifact(s: string): boolean {
-		return /[{}]/.test(s) || /^#[a-zA-Z]/.test(s);
+	// Returns true if the string is not a usable metadata value — either an
+	// unresolved template literal (e.g. "#author.fullName}", "{{title}}") or a
+	// placeholder containing no letters/digits (e.g. ". .", "-", "_") emitted
+	// by some CMSes when a field is empty.
+	private static isPlaceholderValue(s: string): boolean {
+		if (/[{}]/.test(s) || /^#[a-zA-Z]/.test(s)) return true;
+		if (!/[\p{L}\p{N}]/u.test(s)) return true;
+		return false;
+	}
+
+	// Returns the first candidate that is truthy and not a placeholder.
+	// Takes thunks so expensive sources (schema tree walks, querySelectorAll)
+	// are only evaluated until the first usable value is found.
+	private static firstValid(thunks: Array<() => string>): string {
+		for (const thunk of thunks) {
+			const v = thunk();
+			if (v && !this.isPlaceholderValue(v)) return v;
+		}
+		return '';
 	}
 
 	private static getAuthor(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
@@ -80,12 +95,12 @@ export class MetadataExtractor {
 			this.getMetaContent(metaTags, "name", "author") ||
 			this.getMetaContent(metaTags, "name", "byl") ||
 			this.getMetaContent(metaTags, "name", "authorList");
-		if (authorsString && !this.isTemplateArtifact(authorsString)) return this.cleanAuthorString(authorsString);
+		if (authorsString && !this.isPlaceholderValue(authorsString)) return this.cleanAuthorString(authorsString);
 
 		// Conventions for research paper meta tags
-		let authorsStrings: string[] = this.getMetaContents(metaTags, "name", "citation_author").filter(s => !this.isTemplateArtifact(s));
+		let authorsStrings: string[] = this.getMetaContents(metaTags, "name", "citation_author").filter(s => !this.isPlaceholderValue(s));
 		if (authorsStrings.length === 0) {
-			authorsStrings = this.getMetaContents(metaTags, "property", "dc.creator").filter(s => !this.isTemplateArtifact(s));
+			authorsStrings = this.getMetaContents(metaTags, "property", "dc.creator").filter(s => !this.isPlaceholderValue(s));
 		}
 		if (authorsStrings.length > 0) {
 			authorsString = authorsStrings.map(s => {
@@ -106,7 +121,7 @@ export class MetadataExtractor {
 		if (schemaAuthors) {
 			const parts = schemaAuthors.split(',')
 				.map(part => part.trim().replace(/,$/, '').trim())
-				.filter(Boolean);
+				.filter(part => part && !this.isPlaceholderValue(part));
 			if (parts.length > 0) {
 				let uniqueSchemaAuthors = [...new Set(parts)];
 				if (uniqueSchemaAuthors.length > 10) {
@@ -117,13 +132,30 @@ export class MetadataExtractor {
 		}
 
 		// 3. DOM elements
+
+		// Short-circuit on rel="author": running before `.author` stops a container
+		// that wraps a bio from contributing bio text to the collection below.
+		const relAuthorEls = doc.querySelectorAll('a[rel~="author"], address[rel~="author"]');
+		if (relAuthorEls.length > 0 && relAuthorEls.length <= 3) {
+			const relNames: string[] = [];
+			relAuthorEls.forEach(el => {
+				const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+				const lower = text.toLowerCase();
+				if (text && text.length < 100 && lower !== 'author' && lower !== 'authors' && !this.isPlaceholderValue(text)) {
+					relNames.push(text);
+				}
+			});
+			const uniqueRelNames = [...new Set(relNames)];
+			if (uniqueRelNames.length > 0) return uniqueRelNames.join(', ');
+		}
+
 		const collectedAuthorsFromDOM: string[] = [];
 		const addDomAuthor = (value: string | null | undefined) => {
 			if (!value) return;
 			value.split(',').forEach(namePart => {
 				const cleanedName = namePart.replace(/\s+/g, ' ').trim().replace(/,$/, '').trim();
 				const lowerCleanedName = cleanedName.toLowerCase();
-				if (cleanedName && lowerCleanedName !== 'author' && lowerCleanedName !== 'authors') {
+				if (cleanedName && lowerCleanedName !== 'author' && lowerCleanedName !== 'authors' && !this.isPlaceholderValue(cleanedName)) {
 					collectedAuthorsFromDOM.push(cleanedName);
 				}
 			});
@@ -252,18 +284,17 @@ export class MetadataExtractor {
 	}
 
 	private static getSiteName(schemaOrgData: any, metaTags: MetaTagItem[]): string {
-		const candidate = (
-			this.getSchemaProperty(schemaOrgData, 'publisher.name') ||
-			this.getMetaContent(metaTags, "property", "og:site_name") ||
-			this.getMetaContent(metaTags, "name", "og:site_name") ||
-			this.getSchemaProperty(schemaOrgData, 'WebSite.name') ||
-			this.getSchemaProperty(schemaOrgData, 'sourceOrganization.name') ||
-			this.getMetaContent(metaTags, "name", "copyright") ||
-			this.getSchemaProperty(schemaOrgData, 'copyrightHolder.name') ||
-			this.getSchemaProperty(schemaOrgData, 'isPartOf.name') ||
-			this.getMetaContent(metaTags, "name", "application-name") ||
-			''
-		);
+		const candidate = this.firstValid([
+			() => this.getSchemaProperty(schemaOrgData, 'publisher.name'),
+			() => this.getMetaContent(metaTags, "property", "og:site_name"),
+			() => this.getMetaContent(metaTags, "name", "og:site_name"),
+			() => this.getSchemaProperty(schemaOrgData, 'WebSite.name'),
+			() => this.getSchemaProperty(schemaOrgData, 'sourceOrganization.name'),
+			() => this.getMetaContent(metaTags, "name", "copyright"),
+			() => this.getSchemaProperty(schemaOrgData, 'copyrightHolder.name'),
+			() => this.getSchemaProperty(schemaOrgData, 'isPartOf.name'),
+			() => this.getMetaContent(metaTags, "name", "application-name"),
+		]);
 
 		// Reject candidates that are too long to be a real site name —
 		// some pages set og:site_name to the full page title.
@@ -282,7 +313,7 @@ export class MetadataExtractor {
 			this.getMetaContent(metaTags, "name", "title"),
 			this.getMetaContent(metaTags, "name", "sailthru.title"),
 			doc.querySelector('title')?.textContent?.trim() || '',
-		].filter(Boolean);
+		].filter(c => c && !this.isPlaceholderValue(c));
 
 		if (candidates.length === 0) return '';
 
@@ -442,15 +473,14 @@ export class MetadataExtractor {
 	}
 
 	private static getDescription(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
-		return (
-			this.getMetaContent(metaTags, "name", "description") ||
-			this.getMetaContent(metaTags, "property", "description") ||
-			this.getMetaContent(metaTags, "property", "og:description") ||
-			this.getSchemaProperty(schemaOrgData, 'description') ||
-			this.getMetaContent(metaTags, "name", "twitter:description") ||
-			this.getMetaContent(metaTags, "name", "sailthru.description") ||
-			''
-		);
+		return this.firstValid([
+			() => this.getMetaContent(metaTags, "name", "description"),
+			() => this.getMetaContent(metaTags, "property", "description"),
+			() => this.getMetaContent(metaTags, "property", "og:description"),
+			() => this.getSchemaProperty(schemaOrgData, 'description'),
+			() => this.getMetaContent(metaTags, "name", "twitter:description"),
+			() => this.getMetaContent(metaTags, "name", "sailthru.description"),
+		]);
 	}
 
 	private static getImage(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
@@ -515,13 +545,14 @@ export class MetadataExtractor {
 	}
 
 	private static getPublished(doc: Document, schemaOrgData: any, metaTags: MetaTagItem[]): string {
-		const result =
-			this.getSchemaProperty(schemaOrgData, 'datePublished') ||
-			this.getMetaContent(metaTags, "name", "publishDate") ||
-			this.getMetaContent(metaTags, "property", "article:published_time") ||
-			(doc.querySelector('abbr[itemprop="datePublished"]') as HTMLElement)?.title?.trim() ||
-			this.getTimeElement(doc) ||
-			this.getMetaContent(metaTags, "name", "sailthru.date");
+		const result = this.firstValid([
+			() => this.getSchemaProperty(schemaOrgData, 'datePublished'),
+			() => this.getMetaContent(metaTags, "name", "publishDate"),
+			() => this.getMetaContent(metaTags, "property", "article:published_time"),
+			() => (doc.querySelector('abbr[itemprop="datePublished"]') as HTMLElement)?.title?.trim() || '',
+			() => this.getTimeElement(doc),
+			() => this.getMetaContent(metaTags, "name", "sailthru.date"),
+		]);
 		if (result) return result;
 
 		// Look for date text near the article heading
@@ -654,7 +685,8 @@ export class MetadataExtractor {
 			if (results.length === 0) {
 				results = searchSchema(schemaOrgData, property.split('.'), '', false);
 			}
-			const result = results.length > 0 ? results.filter(Boolean).join(', ') : defaultValue;
+			const unique = [...new Set(results.filter(Boolean))];
+			const result = unique.length > 0 ? unique.join(', ') : defaultValue;
 			return result;
 		} catch (error) {
 			console.error(`Error in getSchemaProperty for ${property}:`, error);

@@ -1,6 +1,7 @@
 import { BaseExtractor } from './_base';
 import { ExtractorResult } from '../types/extractors';
 import { parseHTML, serializeHTML, escapeHtml } from '../utils/dom';
+import { buildContentHtml } from '../utils/comments';
 
 interface OembedResponse {
 	html: string;
@@ -165,36 +166,19 @@ export class XOembedExtractor extends BaseExtractor {
 			? `@${data.author_url.split('/').pop()}`
 			: '';
 
-		const dateLink = blockquote?.querySelector('a:last-child');
-		const dateText = dateLink?.textContent?.trim() || '';
-		const permalink = dateLink?.getAttribute('href') || this.url;
+		const contentHtml = buildContentHtml('twitter', tweetText, '');
 
-		const escapedAuthorName = escapeHtml(data.author_name);
-		const escapedHandle = escapeHtml(handle);
-		const escapedDateText = escapeHtml(dateText);
-		const escapedPermalink = escapeHtml(permalink);
-
-		const contentHtml = `
-			<div class="tweet-thread">
-				<div class="main-tweet">
-					<div class="tweet">
-						<div class="tweet-header">
-							<span class="tweet-author"><strong>${escapedAuthorName}</strong> <span class="tweet-handle">${escapedHandle}</span></span>
-							${dateText ? `<a href="${escapedPermalink}" class="tweet-date">${escapedDateText}</a>` : ''}
-						</div>
-						${tweetText ? `<div class="tweet-text">${tweetText}</div>` : ''}
-					</div>
-				</div>
-			</div>
-		`.trim();
+		const author = handle || data.author_name;
+		const description = tweetText.replace(/<[^>]*>/g, '').trim().slice(0, 140).replace(/\s+/g, ' ');
 
 		return {
 			content: contentHtml,
 			contentHtml: contentHtml,
 			variables: {
-				title: `Post by ${handle || data.author_name}`,
-				author: handle || data.author_name,
+				title: this.postTitle(author, 'X'),
+				author,
 				site: 'X (Twitter)',
+				description,
 			}
 		};
 	}
@@ -267,16 +251,19 @@ export class XOembedExtractor extends BaseExtractor {
 	private buildTweetResult(data: FxTwitterResponse): ExtractorResult {
 		const tweet = data.tweet;
 		const handle = `@${tweet.author.screen_name}`;
-		const contentHtml = this.renderTweet(tweet);
+		const postContent = this.renderTweet(tweet);
+		const contentHtml = buildContentHtml('twitter', postContent, '');
 		const published = this.toDateString(tweet.created_at);
+		const description = (tweet.text || '').trim().slice(0, 140).replace(/\s+/g, ' ');
 
 		return {
 			content: contentHtml,
 			contentHtml,
 			variables: {
-				title: `Post by ${handle}`,
+				title: this.postTitle(handle, 'X'),
 				author: handle,
 				site: 'X (Twitter)',
+				description,
 				...(published && { published }),
 			}
 		};
@@ -325,13 +312,7 @@ export class XOembedExtractor extends BaseExtractor {
 			}
 		}
 
-		const handle = escapeHtml(`@${tweet.author.screen_name}`);
-		const authorName = escapeHtml(tweet.author.name);
-
-		return `<div class="tweet-thread"><div class="main-tweet"><div class="tweet">` +
-			`<div class="tweet-header"><span class="tweet-author"><strong>${authorName}</strong> <span class="tweet-handle">${handle}</span></span></div>` +
-			`<div class="tweet-text">${htmlParts.join('\n')}</div>` +
-			`</div></div></div>`;
+		return htmlParts.join('\n');
 	}
 
 	private applyMarkers(text: string, markers: Marker[]): string {
