@@ -16,10 +16,13 @@ type GenericElement = {
 		cells?: ArrayLike<{}>;
 	}>;
 	parentNode?: GenericElement | null;
+	previousSibling?: Node | null;
 	nextSibling?: GenericElement | null;
 	nodeName: string;
 	innerHTML: string;
+	outerHTML?: string;
 	children?: ArrayLike<GenericElement>;
+	childNodes?: ArrayLike<Node>;
 	cloneNode: (deep?: boolean) => Node;
 	textContent?: string | null;
 	attributes?: NamedNodeMap;
@@ -40,6 +43,34 @@ export function asGenericElement(node: any): GenericElement {
 
 const WIDTH_DESCRIPTOR_RE = /^(\d+)w,?$/;
 const DENSITY_DESCRIPTOR_RE = /^\d+(?:\.\d+)?x,?$/;
+
+// MathML element names, used to detect whether a <math> has real MathML to fall
+// back on (vs. only a rendered-text annotation). Hoisted so the sets aren't
+// rebuilt on every math element during conversion.
+const MATHML_NODE_NAMES = new Set([
+	'annotation', 'maction', 'math', 'menclose', 'merror', 'mfenced', 'mfrac', 'mi',
+	'mmultiscripts', 'mn', 'mo', 'mover', 'mpadded', 'mphantom', 'mprescripts',
+	'mroot', 'mrow', 'ms', 'mspace', 'msqrt', 'mstyle', 'msub', 'msubsup',
+	'msup', 'mtable', 'mtd', 'mtext', 'mtr', 'munder', 'munderover', 'none',
+	'semantics'
+]);
+
+// MathML elements whose structure can't be faithfully represented by a flat
+// rendered-text data-latex/alttext, so we prefer converting the MathML instead.
+const COMPLEX_MATHML_NODE_NAMES = new Set([
+	'menclose', 'mfrac', 'mmultiscripts', 'mover', 'mroot', 'msqrt', 'msub',
+	'msubsup', 'msup', 'mtable', 'mtd', 'mtr', 'munder', 'munderover'
+]);
+
+function formatMarkdownLinkDestination(href: string): string {
+	if (!/\s/.test(href)) return href.replace(/([()])/g, '\\$1');
+	return `<${href.replace(/>/g, '\\>')}>`;
+}
+
+function formatMarkdownLinkTitle(title: string | null): string {
+	if (!title) return '';
+	return ` "${title.replace(/(\n+\s*)+/g, '\n').replace(/"/g, '\\"')}"`;
+}
 
 function getBestImageSrc(node: GenericElement): string {
 	const srcset = node.getAttribute('srcset');
@@ -143,13 +174,13 @@ export function createMarkdownContent(content: string, url: string) {
 				: Array.from(node.querySelectorAll('tr')).filter(
 					(tr: any) => isDirectTableChild(tr, node)
 				);
-			const rows = rowElements.map((row: any) => {
+			const rows: string[][] = rowElements.map((row: any) => {
 				const cellElements: any[] = row.cells && row.cells.length > 0
 					? Array.from(row.cells)
 					: Array.from(row.querySelectorAll('td, th')).filter(
 						(cell: any) => cell.parentNode === row
 					);
-				const cellContents = cellElements.map((cell: any) => {
+				return cellElements.map((cell: any) => {
 					// Remove newlines and trim the content
 					let cellContent = turndownService.turndown(serializeHTML(cell))
 						.replace(/\n/g, ' ')
@@ -158,16 +189,34 @@ export function createMarkdownContent(content: string, url: string) {
 					cellContent = cellContent.replace(/\|/g, '\\|');
 					return cellContent;
 				});
-				return `| ${cellContents.join(' | ')} |`;
 			});
 
 			if (!rows.length) return content;
 
-			// Create the separator row
-			const separatorRow = `| ${Array(rows[0].split('|').length - 2).fill('---').join(' | ')} |`;
+			// A markdown table's width is fixed by its separator row; parsers
+			// drop body cells beyond it and pad rows that fall short. Source
+			// tables can be ragged, so size every row to the widest one. This
+			// preserves trailing columns the old "use row 0" logic dropped, and
+			// counting cell elements (not splitting the rendered string on '|')
+			// avoids miscounting escaped pipes inside cell content.
+			const columnCount = Math.max(...rows.map(r => r.length));
+			if (columnCount === 0) return content;
+
+			const formatRow = (cells: string[]): string => {
+				const padded = cells.length < columnCount
+					? [...cells, ...Array(columnCount - cells.length).fill('')]
+					: cells;
+				return `| ${padded.join(' | ')} |`;
+			};
+
+			const separatorRow = `| ${Array(columnCount).fill('---').join(' | ')} |`;
 
 			// Combine all rows
-			const tableContent = [rows[0], separatorRow, ...rows.slice(1)].join('\n');
+			const tableContent = [
+				formatRow(rows[0]),
+				separatorRow,
+				...rows.slice(1).map(formatRow)
+			].join('\n');
 
 			return `\n\n${tableContent}\n\n`;
 		}
@@ -392,6 +441,18 @@ export function createMarkdownContent(content: string, url: string) {
 		}
 	});
 
+	turndownService.addRule('link', {
+		filter: 'a',
+		replacement: function(content, node) {
+			if (!isGenericElement(node)) return content;
+			const href = node.getAttribute('href');
+			if (!href) return content;
+			const title = formatMarkdownLinkTitle(node.getAttribute('title'));
+			const destination = formatMarkdownLinkDestination(href);
+			return `[${content}](${destination}${title})`;
+		}
+	});
+
 	// Add a new custom rule for complex link structures
 	turndownService.addRule('complexLinkStructure', {
 		filter: function (node, options) {
@@ -421,10 +482,7 @@ export function createMarkdownContent(content: string, url: string) {
 			// Construct the new markdown
 			let markdown = `${headingContent}\n\n${remainingContent}\n\n`;
 			if (href) {
-				markdown += `[View original](${href})`;
-				if (title) {
-					markdown += ` "${title}"`;
-				}
+				markdown += `[View original](${formatMarkdownLinkDestination(href)}${formatMarkdownLinkTitle(title)})`;
 			}
 			
 			return markdown;
@@ -591,11 +649,13 @@ export function createMarkdownContent(content: string, url: string) {
 			if (!isInTable && (
 				node.getAttribute('display') === 'block' || 
 				node.classList?.contains('mwe-math-fallback-image-display') || 
+				isOnlyMathInParagraph(node) ||
 				(node.parentNode && isGenericElement(node.parentNode) && 
 				node.parentNode.classList?.contains('mwe-math-element') && 
 				node.parentNode.previousSibling && isGenericElement(node.parentNode.previousSibling) && 
 				node.parentNode.previousSibling.nodeName.toLowerCase() === 'p')
 			)) {
+				latex = formatBlockLatex(latex);
 				return `\n$$\n${latex}\n$$\n`;
 			} else {
 				// For inline math, ensure there's a space before and after only if needed
@@ -738,24 +798,115 @@ export function createMarkdownContent(content: string, url: string) {
 	}
 
 	function extractLatex(element: GenericElement): string {
-		let latex = element.getAttribute('data-latex');
+		const annotation = element.querySelector('annotation[encoding="application/x-tex"]');
+		if (annotation?.textContent?.trim()) {
+			return annotation.textContent.trim();
+		}
+
+		const latex = element.getAttribute('data-latex');
 		const alttext = element.getAttribute('alttext');
-		if (latex) {
+		const hasMathML = hasMathMLChildren(element);
+		const hasComplexMathML = hasComplexMathMLChildren(element);
+
+		if (latex && (!hasMathML || isTrustworthyLatexAttribute(latex, hasComplexMathML))) {
 			return latex.trim();
-		} else if (alttext) {
+		} else if (alttext && (!hasMathML || isTrustworthyLatexAttribute(alttext, hasComplexMathML))) {
 			return alttext.trim();
 		}
+
 		// Fallback: convert MathML → LaTeX for renderers like MathJax SVG that embed no LaTeX.
 		// Fails silently when mathml-to-latex is unavailable (core bundle).
-		if (element.nodeName.toLowerCase() === 'math') {
-			try {
-				const { MathMLToLaTeX } = require('mathml-to-latex');
-				return MathMLToLaTeX.convert(`<math>${element.innerHTML}</math>`).trim();
-			} catch (e) {
-				// not available or conversion failed
+		if (element.nodeName.toLowerCase() === 'math' && hasMathML) {
+			const converted = convertMathMLToLatex(element);
+			if (converted) return converted;
+		}
+
+		if (latex) return latex.trim();
+		if (alttext) return alttext.trim();
+		return '';
+	}
+
+	function hasMathMLChildren(element: GenericElement): boolean {
+		return Array.from(element.children || []).some(child => {
+			const namespace = (child as unknown as Element).namespaceURI;
+			return namespace === 'http://www.w3.org/1998/Math/MathML' ||
+				MATHML_NODE_NAMES.has(child.nodeName.toLowerCase());
+		});
+	}
+
+	function hasComplexMathMLChildren(element: GenericElement): boolean {
+		const visit = (node: GenericElement): boolean => {
+			if (COMPLEX_MATHML_NODE_NAMES.has(node.nodeName.toLowerCase())) {
+				return true;
 			}
+
+			return Array.from(node.children || []).some(child => visit(child));
+		};
+
+		return visit(element);
+	}
+
+	function convertMathMLToLatex(element: GenericElement): string {
+		try {
+			const { MathMLToLaTeX } = require('mathml-to-latex');
+			const mathML = (element.outerHTML || `<math>${element.innerHTML}</math>`)
+				.replace(/&amp;nbsp;/g, '&#xA0;')
+				.replace(/&nbsp;/g, '&#xA0;');
+			return MathMLToLaTeX.convert(mathML).trim();
+		} catch (e) {
+			// not available or conversion failed
 		}
 		return '';
+	}
+
+	function isLikelyLatexSource(value: string): boolean {
+		return /\\[a-zA-Z]+|[_^{}]|[$&]|\\\\|\\begin\{/.test(value);
+	}
+
+	function isTrustworthyLatexAttribute(value: string, hasComplexMathML: boolean): boolean {
+		if (isLikelyLatexSource(value)) return true;
+
+		const trimmed = value.trim();
+		if (!trimmed) return false;
+
+		if (hasComplexMathML) return false;
+
+		// Rendered prose fragments such as "fan-outfan-in" can be written into
+		// data-latex by upstream normalizers. Keep simple symbolic text like
+		// "AB", "A, B", or "∑", but prefer MathML for hyphenated word fragments.
+		return !/[a-zA-Z]{3,}-[a-zA-Z]{2,}/.test(trimmed);
+	}
+
+	function hasLatexEnvironment(value: string): boolean {
+		return /\\begin\{[^}]+\}/.test(value);
+	}
+
+	function formatBlockLatex(value: string): string {
+		const latex = value.trim();
+		if (!latex || hasLatexEnvironment(latex)) return latex;
+
+		if (latex.includes('\\\\') || latex.includes('&')) {
+			return `\\begin{aligned}\n${latex}\n\\end{aligned}`;
+		}
+
+		return latex;
+	}
+
+	function isOnlyMathInParagraph(element: GenericElement): boolean {
+		const parent = element.parentNode;
+		if (!parent || !isGenericElement(parent) || parent.nodeName.toLowerCase() !== 'p') {
+			return false;
+		}
+
+		const elementChildren = Array.from(parent.children || []);
+		if (elementChildren.length !== 1 || elementChildren[0] !== element) {
+			return false;
+		}
+
+		const currentNode = element as unknown as Node;
+		return Array.from(parent.childNodes || []).every(child => {
+			return child === currentNode || (isTextNode(child) && child.textContent?.trim() === '');
+		});
 	}
 
 	try {
